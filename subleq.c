@@ -1,0 +1,1150 @@
+/*
+ * subleq.c - A 16-bit SUBLEQ CPU running eForth.
+ *
+ * This file implements a virtual machine for a 16-bit SUBLEQ (Subtract and
+ * Branch if Less than or Equal to zero) machine. It includes an optimizer
+ * to convert common SUBLEQ instruction sequences into single, faster
+ * extended operations for improved performance with programs like eForth.
+ */
+
+#include <assert.h>
+#include <ctype.h>
+#include <errno.h>
+#include <inttypes.h>
+#include <limits.h>
+#include <stdarg.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+/* Platform detection for POSIX systems (Unix, macOS, etc.) */
+#if defined(unix) || defined(__unix__) || defined(__unix) || \
+    (defined(__APPLE__) && defined(__MACH__))
+#define PLAT_POSIX
+#endif
+
+/* Include POSIX-specific headers for terminal control */
+#ifdef PLAT_POSIX
+#include <poll.h>
+#include <termios.h>
+#include <unistd.h>
+#endif
+
+/* Tail-call optimization attribute */
+#if defined(__has_attribute) && __has_attribute(musttail)
+#define MUST_TAIL __attribute__((musttail))
+#else
+#define MUST_TAIL
+#endif
+
+/* Compiler-specific attributes for optimization */
+#if defined(__clang__) || defined(__GNUC__)
+#define HOT_PATH __attribute__((hot))
+#define UNLIKELY(x) __builtin_expect(!!(x), 0)
+#define UNREACHABLE __builtin_unreachable()
+#else
+#define HOT_PATH
+#define UNLIKELY(x) (x)
+#define UNREACHABLE \
+    do {            \
+    } while (0)
+#endif
+
+#if defined(__GNUC__) || defined(__clang__)
+#define HAS_BUILTIN_CONSTANT_P 1
+#define IS_COMPILE_TIME_CONSTANT(x) __builtin_constant_p(x)
+#else
+#define HAS_BUILTIN_CONSTANT_P 0
+#define IS_COMPILE_TIME_CONSTANT(x) 0
+#endif
+
+/* Memory size for 16-bit addressing (2^16 = 65536 words) */
+#define SZ (1 << 16)
+
+/* Mask address to 16-bit range (0-65535) */
+#define MASK_ADDR(a) ((a) & (SZ - 1))
+
+/* Create a mask for N-bit values */
+#define MASK_BITS(nbits) \
+    ((nbits) < 16 ? (uint16_t) ((1UL << (nbits)) - 1) : (uint16_t) 0xFFFFUL)
+
+/* Maximum depth for optimizer pattern scanning */
+#define OPTIMIZER_SCAN_DEPTH (3 * 64)
+
+#ifdef PLAT_POSIX
+static struct termios orig_termios;
+static bool term_initialized = false;
+
+/* Restore original terminal settings at exit */
+static void restore_terminal(void)
+{
+    if (!term_initialized)
+        return;
+    tcsetattr(STDIN_FILENO, TCSANOW, &orig_termios);
+    term_initialized = false;
+}
+
+/* Set terminal to raw mode for non-buffered, non-echoed input */
+static void set_raw_mode(void)
+{
+    if (term_initialized)
+        return;
+    if (tcgetattr(STDIN_FILENO, &orig_termios) == -1)
+        return;
+
+    struct termios raw = orig_termios;
+    raw.c_lflag &= ~(ECHO | ICANON | ISIG);
+    raw.c_iflag &= ~(IXON | ICRNL);
+    raw.c_oflag &= ~(OPOST);
+    raw.c_cc[VMIN] = 0;
+    raw.c_cc[VTIME] = 0;
+    if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) == -1)
+        return;
+
+    term_initialized = true;
+    atexit(restore_terminal);
+}
+
+/* Read a character from input stream, handling raw mode with non-blocking poll
+ */
+static int vm_getch(FILE *in)
+{
+    int fd = fileno(in);
+    if (!isatty(fd))
+        return fgetc(in);
+
+    struct pollfd pfd = {.fd = fd, .events = POLLIN};
+    unsigned char ch;
+    int n;
+
+    while ((n = poll(&pfd, 1, 0)) < 0) {
+        if (errno != EAGAIN && errno != EINTR)
+            return -1;
+    }
+    if (n == 0)
+        return -1;
+    while (read(fd, &ch, 1) < 0) {
+        if (errno != EAGAIN && errno != EINTR)
+            return -1;
+    }
+    return ch == 127 ? 8 : ch; /* Map DEL to backspace */
+}
+
+/* Write a character to output stream, flushing for TTY */
+static int vm_putch(int ch, FILE *out)
+{
+    if (fputc(ch, out) < 0)
+        return -1;
+    if (isatty(fileno(out)))
+        fflush(out);
+    return ch;
+}
+#else
+/* Fallback for non-POSIX systems */
+static int vm_getch(FILE *in)
+{
+    return fgetc(in);
+}
+
+static int vm_putch(int ch, FILE *out)
+{
+    if (fputc(ch, out) < 0 || fflush(out) < 0)
+        return -1;
+    return ch;
+}
+#endif
+
+/* Extended instruction set with increment values */
+#define INSN_LIST \
+    _(SUBLEQ, 3)  \
+    _(JMP, 0)     \
+    _(ADD, 9)     \
+    _(SUB, 3)     \
+    _(MOV, 12)    \
+    _(ZERO, 3)    \
+    _(PUT, 3)     \
+    _(GET, 3)     \
+    _(HALT, 0)    \
+    _(IADD, 21)   \
+    _(ISUB, 15)   \
+    _(IJMP, 0)    \
+    _(ILOAD, 24)  \
+    _(ISTORE, 36) \
+    _(INC, 3)     \
+    _(DEC, 3)     \
+    _(INV, 21)    \
+    _(NEG, 6)     \
+    _(LSHIFT, 9)  \
+    _(DOUBLE, 9)
+
+/* clang-format off */
+enum {
+#define _(inst, inc) inst,
+    INSN_LIST
+#undef _
+    IMAX
+};
+/* clang-format on */
+
+enum {
+#define _(inst, inc) INSN_INCR_##inst = inc,
+    INSN_LIST
+#undef _
+};
+
+static const char *insn_names[] = {
+#define _(inst, inc) #inst,
+    INSN_LIST
+#undef _
+};
+
+/* Optimized instruction structure */
+typedef struct {
+    uint8_t opcode; /* Instruction opcode (from INSN_LIST) */
+    uint16_t src;   /* Source operand address/value */
+    uint16_t dst;   /* Destination operand address */
+    uint16_t aux;   /* Auxiliary operand (e.g., SUBLEQ jump target) */
+} insn_t;
+
+/* Optimizer state */
+typedef struct {
+    int matches[IMAX];        /* Count of matched instructions */
+    unsigned set[10];         /* Tracks set variables ('0'-'9') */
+    uint16_t vars[10];        /* Captured variable values */
+    unsigned version;         /* Version counter for variable reset */
+    int64_t exec_count[IMAX]; /* Execution count per instruction */
+    uint8_t zero_reg[SZ];     /* Tracks memory locations holding 0 */
+    uint8_t one_reg[SZ];      /* Tracks memory locations holding 1 */
+    uint8_t neg1_reg[SZ];     /* Tracks memory locations holding 0xFFFF */
+    clock_t start, end;       /* Timers for performance measurement */
+} optimizer_t;
+
+/* Main VM context */
+typedef struct {
+    uint16_t *mem;         /* Main memory (16-bit words) */
+    insn_t *insn_mem;      /* Optimized instruction memory */
+    uint64_t nbits;        /* Word size in bits (e.g., 16) */
+    uint16_t mask;         /* Bitmask for N-bit values */
+    uint64_t mem_size;     /* Total memory size in words */
+    uint64_t pc;           /* Program counter */
+    uint64_t load_size;    /* Loaded memory size */
+    uint64_t max_addr;     /* Highest address written */
+    optimizer_t opt;       /* Optimizer state */
+    FILE *in, *out;        /* Input/output streams */
+    int error;             /* Error flag (0 = no error, -1 = error) */
+    bool stats_enabled;    /* Enable performance statistics */
+    bool optimize_enabled; /* Enable instruction optimization */
+} vm_t;
+
+/* Forward declaration for the dispatcher with the unified signature */
+static void dispatch(vm_t *vm, uint64_t pc, const insn_t *insn);
+
+/* Define instruction handlers.
+ * It accepts a pointer to the current instruction (@insn) to avoid redundant
+ * memory lookups for its operands. The tail call to dispatch passes NULL for
+ * the unused @insn parameter to maintain signature compatibility, which is
+ * required for the 'musttail' attribute.
+ */
+#define HANDLE(inst, body)                                    \
+    HOT_PATH static void handle_##inst(vm_t *vm, uint64_t pc, \
+                                       const insn_t *insn)    \
+    {                                                         \
+        (void) pc;                                            \
+        (void) insn;                                          \
+                                                              \
+        uint64_t next_pc = pc + INSN_INCR_##inst;             \
+        do                                                    \
+            body while (0);                                   \
+        if (UNLIKELY(vm->error))                              \
+            return;                                           \
+        MUST_TAIL return dispatch(vm, next_pc, NULL);         \
+    }
+
+/* SUBLEQ: Subtract and branch if less than or equal to zero */
+HANDLE(SUBLEQ, {
+    /* Operands are pre-fetched from memory by the optimizer */
+    uint16_t a = insn->src;
+    uint16_t b = insn->dst;
+    uint16_t c = insn->aux;
+
+    if (UNLIKELY(a == vm->mask)) { /* Input */
+        int ch = vm_getch(vm->in);
+        if (UNLIKELY(ch == EOF || ch == -1)) {
+            vm->error = -1;
+            return;
+        }
+        vm->mem[MASK_ADDR(b)] = (uint16_t) ch;
+    } else if (UNLIKELY(b == vm->mask)) { /* Output */
+        if (UNLIKELY(vm_putch(vm->mem[MASK_ADDR(a)], vm->out) < 0)) {
+            vm->error = -1;
+            return;
+        }
+    } else { /* Standard SUBLEQ */
+        uint16_t la = MASK_ADDR(a);
+        uint16_t lb = MASK_ADDR(b);
+        uint16_t result = vm->mem[lb] - vm->mem[la];
+        vm->mem[lb] = result;
+        if (UNLIKELY(lb > vm->max_addr))
+            vm->max_addr = lb;
+        if (result == 0 || (result & (1U << (vm->nbits - 1))))
+            next_pc = c;
+    }
+})
+
+/* JMP: Unconditional jump */
+HANDLE(JMP, {
+    uint16_t dst = insn->dst;
+    /* Often the address cleared to 0 by the JMP sequence */
+    uint16_t src = insn->src;
+    vm->mem[MASK_ADDR(src)] = 0;
+    next_pc = dst;
+})
+
+/* MOV: Move data */
+HANDLE(MOV, {
+    uint16_t dst = insn->dst;
+    uint16_t src = insn->src;
+    vm->mem[MASK_ADDR(dst)] = vm->mem[MASK_ADDR(src)];
+})
+
+/* ADD: Addition */
+HANDLE(ADD, {
+    uint16_t dst = insn->dst;
+    uint16_t src = insn->src;
+    /* Unsigned arithmetic provides wrap-around behavior automatically */
+    vm->mem[MASK_ADDR(dst)] += vm->mem[MASK_ADDR(src)];
+})
+
+/* SUB: Subtraction */
+HANDLE(SUB, {
+    uint16_t dst = insn->dst;
+    uint16_t src = insn->src;
+    vm->mem[MASK_ADDR(dst)] -= vm->mem[MASK_ADDR(src)];
+})
+
+/* ZERO: Clear memory location */
+HANDLE(ZERO, {
+    uint16_t dst = insn->dst;
+    vm->mem[MASK_ADDR(dst)] = 0;
+})
+
+/* PUT: Output character */
+HANDLE(PUT, {
+    uint16_t src = insn->src;
+    if (UNLIKELY(vm_putch(vm->mem[MASK_ADDR(src)], vm->out) < 0)) {
+        vm->error = -1;
+        return;
+    }
+})
+
+/* GET: Input character */
+HANDLE(GET, {
+    uint16_t dst = insn->dst;
+    int ch = vm_getch(vm->in);
+    if (UNLIKELY(ch == EOF || ch == -1)) {
+        vm->error = -1;
+        return;
+    }
+    vm->mem[MASK_ADDR(dst)] = (uint16_t) ch;
+})
+
+/* HALT: Terminate program */
+HANDLE(HALT, {
+    /* Set PC beyond valid range to stop execution */
+    vm->pc = vm->mem_size / 2;
+    return;
+})
+
+/* IADD: Indirect addition */
+HANDLE(IADD, {
+    uint16_t dst = insn->dst;
+    uint16_t src = insn->src;
+    uint16_t addr = MASK_ADDR(vm->mem[MASK_ADDR(dst)]);
+    vm->mem[addr] += vm->mem[MASK_ADDR(src)];
+})
+
+/* ISUB: Indirect subtraction */
+HANDLE(ISUB, {
+    uint16_t dst = insn->dst;
+    uint16_t src = insn->src;
+    uint16_t addr = MASK_ADDR(vm->mem[MASK_ADDR(dst)]);
+    vm->mem[addr] -= vm->mem[MASK_ADDR(src)];
+})
+
+/* IJMP: Indirect jump */
+HANDLE(IJMP, {
+    uint16_t dst = insn->dst;
+    next_pc = vm->mem[MASK_ADDR(dst)];
+})
+
+/* ILOAD: Indirect load */
+HANDLE(ILOAD, {
+    uint16_t src = insn->src;
+    uint16_t dst = insn->dst;
+    uint16_t addr = vm->mem[MASK_ADDR(src)];
+    /* Special handling for input from I/O address (vm->mask) */
+    if (UNLIKELY(addr == vm->mask)) {
+        int ch = vm_getch(vm->in);
+        if (UNLIKELY(ch == EOF || ch == -1)) {
+            vm->error = -1;
+            return;
+        }
+        vm->mem[MASK_ADDR(dst)] = (uint16_t) (-ch); /* Negated input value */
+    } else {
+        vm->mem[MASK_ADDR(dst)] = vm->mem[MASK_ADDR(addr)];
+    }
+})
+
+/* ISTORE: Indirect store */
+HANDLE(ISTORE, {
+    uint16_t src = insn->src;
+    uint16_t dst = insn->dst;
+    vm->mem[MASK_ADDR(vm->mem[MASK_ADDR(dst)])] = vm->mem[MASK_ADDR(src)];
+})
+
+/* INC: Increment by 1 */
+HANDLE(INC, {
+    uint16_t dst = insn->dst;
+    vm->mem[MASK_ADDR(dst)]++;
+})
+
+/* DEC: Decrement by 1 */
+HANDLE(DEC, {
+    uint16_t dst = insn->dst;
+    vm->mem[MASK_ADDR(dst)]--;
+})
+
+/* INV: Bitwise NOT */
+HANDLE(INV, {
+    uint16_t dst = insn->dst;
+    vm->mem[MASK_ADDR(dst)] = ~vm->mem[MASK_ADDR(dst)];
+})
+
+/* LSHIFT: Left shift by constant */
+HANDLE(LSHIFT, {
+    uint16_t src = insn->src; /* Shift count */
+    uint16_t dst = insn->dst; /* Value to be shifted */
+    vm->mem[MASK_ADDR(dst)] <<= src;
+})
+
+/* DOUBLE: Multiply by 2 (left shift by 1) */
+HANDLE(DOUBLE, {
+    uint16_t dst = insn->dst;
+    vm->mem[MASK_ADDR(dst)] <<= 1;
+})
+
+/* NEG: Two's complement negation (dst = 0 - src) */
+HANDLE(NEG, {
+    uint16_t dst = insn->dst;
+    uint16_t src = insn->src;
+    vm->mem[MASK_ADDR(dst)] = 0 - vm->mem[MASK_ADDR(src)];
+})
+
+/* Pattern matching function for SUBLEQ instruction optimization.
+ * Matches instruction sequences against patterns using a compact
+ * domain-specific language.
+ *
+ * Pattern symbols:
+ * '0'-'9':
+ *   Variable capture/match. These symbols capture the value of the current
+ *   memory word (mem[pc + offset]) into a numbered variable. If the variable
+ *   is already bound, it asserts that the current value matches the bound
+ *   value. Example: '0' captures mem[i], subsequent '0's must match mem[i].
+ *
+ * 'Z':
+ *   Match Zero. Requires the current memory word to be exactly 0.
+ *   Example: "Z Z >" matches three consecutive zeros, where the third zero is
+ *   also the next PC address.
+ *
+ * 'N':
+ *   Match Negative One (All Bits Set). Requires the current memory word to be
+ *   equal to 'vm->mask' (e.g., 0xFFFF for a 16-bit VM). This is often used
+ *   for memory-mapped I/O addresses or special constant values.
+ *   Example: "N ! >" implies 'SUBLEQ 0xFFFF, addr, next_pc'.
+ *
+ * '>':
+ *   Match Next Program Counter Address. Requires the current memory word to be
+ *   '(pc + offset + 1)'. This is the address that SUBLEQ would jump to if the
+ *   preceding SUBLEQ instruction's result is zero or negative. Crucial for
+ *   matching linear code sequences that do not branch.
+ *   Example: "0 1 >" matches a SUBLEQ where the target address is the next
+ *   sequential instruction.
+ *
+ * '%':
+ *   Match Specific Constant (from 'va_arg'). Consumes an argument from the
+ *   'va_list' (expected to be a 'uint16_t'). Requires the current memory word
+ *   to match this provided constant.
+ *   Example: 'match_pattern(vm, ..., "%", 100)' would match if the current
+ *   memory word is 100.
+ *
+ * '!':
+ *   Capture Value to Pointer (from 'va_arg'). Consumes an argument from the
+ *   'va_list' (expected to be a 'uint16_t *'). Stores the value of the
+ *   current memory word into the provided pointer. Does not perform a match;
+ *   solely for extraction. Example: 'match_pattern(vm, ..., "!", &my_var)'
+ *   captures the current memory word into 'my_var'.
+ *
+ * '?':
+ *   Wildcard. Matches any value in the current memory word. Does not capture
+ *   or compare the value. Used to skip irrelevant words in a pattern.
+ *   Example: "0 ? >" matches '0' followed by any value, then the next PC
+ * address.
+ *
+ * 'P':
+ *   Match Positive (non-zero, MSB clear for signed interpretation).
+ *
+ * 'M':
+ *   Match Memory address within valid range.
+ *
+ * 'R':
+ *   Match Register/Variable reference (captured variable).
+ *
+ * @vm: Virtual machine context
+ * @pc: The base program counter for the current instruction sequence
+ * being matched (usually 'i' from the optimizer loop)
+ * @mem: A pointer to the full main memory array of the VM (vm->mem)
+ * @max_len: The maximum number of words available for scanning from 'pc'
+ * @pattern: The string containing the DSL pattern to match
+ * @...: Variable arguments based on pattern symbols like '%' and '!'
+ *
+ * Return true if pattern matches, false otherwise
+ */
+static bool match_pattern(vm_t *vm,
+                          uint64_t pc,
+                          const uint16_t *mem,
+                          int max_len,
+                          const char *pattern,
+                          ...)
+{
+    va_list args;
+    optimizer_t *opt = &vm->opt;
+    uint64_t offset = 0;
+    unsigned version = ++opt->version;
+    bool result = true;
+
+    /* Early validation of input parameters */
+    if (UNLIKELY(!pattern || !mem || max_len <= 0))
+        return false;
+
+    va_start(args, pattern);
+
+    /* Iterate through each character in the pattern */
+    for (const char *p = pattern; *p && result; ++p) {
+        char sym = *p;
+
+        /* Skip whitespace characters for better pattern readability */
+        if (isspace(sym))
+            continue;
+
+        /* Check if we've exceeded the available memory range */
+        if (UNLIKELY(offset >= (uint64_t) max_len)) {
+            result = false;
+            break;
+        }
+
+        uint16_t val = mem[MASK_ADDR(pc + offset)];
+
+        switch (sym) {
+        case '0' ... '9': {
+            /* Variable capture and matching */
+            int var_idx = sym - '0';
+            if (opt->set[var_idx] == version) {
+                /* Variable already bound - verify it matches */
+                if (UNLIKELY(opt->vars[var_idx] != val)) {
+                    result = false;
+                }
+            } else {
+                /* First occurrence - capture the value */
+                opt->set[var_idx] = version;
+                opt->vars[var_idx] = val;
+            }
+            break;
+        }
+
+        case 'Z':
+            /* Match zero value */
+            if (UNLIKELY(val != 0)) {
+                result = false;
+            }
+            break;
+
+        case 'N':
+            /* Match negative one (all bits set) */
+            if (UNLIKELY(val != vm->mask)) {
+                result = false;
+            }
+            break;
+
+        case '>':
+            /* Match next program counter address */
+            if (UNLIKELY(val != pc + offset + 1)) {
+                result = false;
+            }
+            break;
+
+        case '%': {
+            /* Match specific constant from arguments */
+            uint16_t expected = (uint16_t) va_arg(args, int);
+            if (UNLIKELY(val != expected)) {
+                result = false;
+            }
+            break;
+        }
+
+        case '!': {
+            /* Capture value to pointer from arguments */
+            uint16_t *ptr = va_arg(args, uint16_t *);
+            if (ptr) {
+                *ptr = val;
+            }
+            break;
+        }
+
+        case '?':
+            /* Wildcard - matches any value, no operation needed */
+            break;
+
+        case 'P':
+            /* Match positive value (non-zero, MSB clear) */
+            if (UNLIKELY(val == 0 || (val & (1U << (vm->nbits - 1))))) {
+                result = false;
+            }
+            break;
+
+        case 'M':
+            /* Match valid memory address */
+            if (UNLIKELY(val >= vm->mem_size && val != vm->mask)) {
+                result = false;
+            }
+            break;
+
+        case 'R': {
+            /* Match previously captured variable reference */
+            char var_ref = (char) va_arg(args, int);
+            int var_idx = var_ref - '0';
+            if (UNLIKELY(var_idx < 0 || var_idx > 9 ||
+                         opt->set[var_idx] != version ||
+                         opt->vars[var_idx] != val)) {
+                result = false;
+            }
+            break;
+        }
+
+        default:
+            /* Unknown pattern symbol */
+            result = false;
+            break;
+        }
+
+        /* Move to next memory location */
+        offset++;
+    }
+
+    va_end(args);
+    return result;
+}
+
+/* Retrieve variables captured during pattern matching in the optimizer.
+ * Variables are identified by single digits '0'-'9' and must be set in the
+ * current optimizer version context to be considered valid.
+ *
+ * @opt: Pointer to optimizer state containing variable bindings
+ * @var: Variable identifier character ('0' through '9')
+ * Return the captured variable value, or 0xFFFF if variable is invalid/unset
+ */
+static inline uint16_t get_var(const optimizer_t *opt, char var)
+{
+#if HAS_BUILTIN_CONSTANT_P
+    /* Fast path: compile-time bounds check for literal constants */
+    if (IS_COMPILE_TIME_CONSTANT(var)) {
+        if (var < '0' || var > '9')
+            return (uint16_t) -1;
+        const int idx = var - '0';
+        return (opt->set[idx] == opt->version) ? opt->vars[idx] : (uint16_t) -1;
+    }
+#endif
+
+    /* Runtime path: single bounds check with early return */
+    const unsigned char uvar = (unsigned char) var;
+    if (UNLIKELY(uvar < '0' || uvar > '9'))
+        return (uint16_t) -1;
+
+    const int idx = (int) (uvar - '0');
+
+    /* Branchless version check and value retrieval */
+    const bool is_set = (opt->set[idx] == opt->version);
+    return is_set ? opt->vars[idx] : (uint16_t) -1;
+}
+
+/* Identifies common SUBLEQ sequences and replaces them with single extended
+ * instructions. This optimization is crucial for improving the performance
+ * of programs compiled to SUBLEQ, especially for high-level languages like
+ * Forth which involve frequent stack, memory, and arithmetic operations that
+ * translate into many primitive SUBLEQ instructions.
+ *
+ * @vm: Virtual machine context
+ * @proglen: The total number of loaded SUBLEQ words in memory (vm->m)
+ */
+static void optimize(vm_t *vm, uint64_t proglen)
+{
+    optimizer_t *opt = &vm->opt;
+    const uint16_t *mem = vm->mem;
+    insn_t *insn_mem = vm->insn_mem;
+
+    memset(opt->zero_reg, 0, sizeof(opt->zero_reg));
+    memset(opt->one_reg, 0, sizeof(opt->one_reg));
+    memset(opt->neg1_reg, 0, sizeof(opt->neg1_reg));
+    memset(opt->matches, 0, sizeof(opt->matches));
+
+    for (uint64_t i = 0; i < proglen; i++) {
+        opt->zero_reg[i] = (mem[i] == 0);
+        opt->one_reg[i] = (mem[i] == 1);
+        opt->neg1_reg[i] = (mem[i] == vm->mask);
+    }
+
+    for (uint64_t i = 0; i < proglen; i++) {
+        size_t scan_depth = (i + OPTIMIZER_SCAN_DEPTH > proglen)
+                                ? proglen - i
+                                : OPTIMIZER_SCAN_DEPTH;
+        if (scan_depth == 0)
+            continue;
+
+        /* ISTORE: m[m[D]] = S */
+        if (match_pattern(vm, i, mem, (int) scan_depth,
+                          "0Z> 11> 22> Z3> Z4> ZZ> 56> 77> Z7> 6Z> ZZ> 66>")) {
+            insn_mem[i].opcode = ISTORE;
+            insn_mem[i].dst = MASK_ADDR(get_var(opt, '0'));
+            insn_mem[i].src = MASK_ADDR(get_var(opt, '5'));
+            opt->matches[ISTORE]++;
+            continue;
+        }
+
+        /* ILOAD: D = m[m[S]] */
+        uint16_t load_temp = 0;
+        if (match_pattern(vm, i, mem, (int) scan_depth,
+                          "00> !Z> Z0> ZZ> 11> ?Z> Z1> ZZ>", &load_temp) &&
+            get_var(opt, '0') == (i + 15)) {
+            insn_mem[i].opcode = ILOAD;
+            insn_mem[i].dst = MASK_ADDR(get_var(opt, '1'));
+            insn_mem[i].src = MASK_ADDR(load_temp);
+            opt->matches[ILOAD]++;
+            continue;
+        }
+
+        /* LSHIFT: Left shift by constant */
+        uint16_t shift_count = 0;
+        uint16_t shift_dst = 0;
+        uint64_t shift_pos = 0;
+        while (shift_pos < scan_depth) {
+            uint16_t q0 = 0, q1 = 0;
+            if (scan_depth - shift_pos < 9)
+                break;
+            if (match_pattern(vm, i + shift_pos, mem,
+                              (int) (scan_depth - shift_pos), "!Z> Z!> ZZ>",
+                              &q0, &q1) &&
+                q0 == q1) {
+                if (shift_count == 0)
+                    shift_dst = q0;
+                else if (shift_dst != q0)
+                    break;
+                shift_count++;
+                shift_pos += 9;
+            } else {
+                break;
+            }
+        }
+        if (shift_count >= 2) {
+            insn_mem[i].opcode = LSHIFT;
+            insn_mem[i].dst = MASK_ADDR(shift_dst);
+            insn_mem[i].src = shift_count;
+            opt->matches[LSHIFT]++;
+            continue;
+        }
+
+        /* IADD: m[m[D]] += S */
+        if (match_pattern(vm, i, mem, (int) scan_depth,
+                          "01> 23> 44> 14> 3Z> 11> 33>")) {
+            insn_mem[i].opcode = IADD;
+            insn_mem[i].dst = MASK_ADDR(get_var(opt, '0'));
+            insn_mem[i].src = MASK_ADDR(get_var(opt, '2'));
+            opt->matches[IADD]++;
+            continue;
+        }
+
+        /* INV: Bitwise NOT */
+        uint16_t inv_temp = 0;
+        if (match_pattern(vm, i, mem, (int) scan_depth,
+                          "00> 10> 11> 2Z> Z1> ZZ> !1>", &inv_temp) &&
+            opt->one_reg[inv_temp]) {
+            insn_mem[i].opcode = INV;
+            insn_mem[i].dst = MASK_ADDR(get_var(opt, '1'));
+            opt->matches[INV]++;
+            continue;
+        }
+
+        /* ISUB: m[m[D]] -= S */
+        if (match_pattern(vm, i, mem, (int) scan_depth,
+                          "01> 33> 14> 5Z> 11>")) {
+            insn_mem[i].opcode = ISUB;
+            insn_mem[i].dst = MASK_ADDR(get_var(opt, '0'));
+            insn_mem[i].src = MASK_ADDR(get_var(opt, '5'));
+            opt->matches[ISUB]++;
+            continue;
+        }
+
+        /* IJMP: PC = m[D] */
+        uint16_t ijmp_temp = 0;
+        if (match_pattern(vm, i, mem, (int) scan_depth, "00> !Z> Z0> ZZ> ZZ>",
+                          &ijmp_temp) &&
+            get_var(opt, '0') == (i + (3 * 4) + 2)) {
+            insn_mem[i].opcode = IJMP;
+            insn_mem[i].dst = MASK_ADDR(ijmp_temp);
+            opt->matches[IJMP]++;
+            continue;
+        }
+
+        /* MOV: Copy data */
+        uint16_t mov_src = 0;
+        if (match_pattern(vm, i, mem, (int) scan_depth, "00> !Z> Z0> ZZ>",
+                          &mov_src)) {
+            uint16_t dst = MASK_ADDR(get_var(opt, '0'));
+            uint16_t src = MASK_ADDR(mov_src);
+            if (dst != src) {
+                insn_mem[i].opcode = MOV;
+                insn_mem[i].dst = dst;
+                insn_mem[i].src = src;
+                opt->matches[MOV]++;
+                continue;
+            }
+        }
+
+        /* DOUBLE or ADD */
+        uint16_t arith_src = 0, arith_dst = 0;
+        if (match_pattern(vm, i, mem, (int) scan_depth, "!Z> Z!> ZZ>",
+                          &arith_src, &arith_dst)) {
+            if (arith_src == arith_dst) {
+                insn_mem[i].opcode = DOUBLE;
+                insn_mem[i].dst = MASK_ADDR(arith_dst);
+                insn_mem[i].src = MASK_ADDR(arith_src);
+                opt->matches[DOUBLE]++;
+            } else {
+                insn_mem[i].opcode = ADD;
+                insn_mem[i].dst = MASK_ADDR(arith_dst);
+                insn_mem[i].src = MASK_ADDR(arith_src);
+                opt->matches[ADD]++;
+            }
+            continue;
+        }
+
+        /* NEG: Two's complement negation (dst = 0 - src)
+         * Pattern: SUBLEQ DST, DST, PC+3 (DST becomes 0)
+         *          SUBLEQ SRC, DST, PC+6 (DST becomes 0 - SRC)
+         * '0' is DST, '1' is SRC
+         */
+        if (match_pattern(vm, i, mem, (int) scan_depth, "00> 10>")) {
+            insn_mem[i].opcode = NEG;
+            insn_mem[i].dst = MASK_ADDR(get_var(opt, '0'));
+            insn_mem[i].src = MASK_ADDR(get_var(opt, '1'));
+            opt->matches[NEG]++;
+            continue;
+        }
+
+        /* ZERO: Clear memory */
+        if (match_pattern(vm, i, mem, (int) scan_depth, "00>")) {
+            insn_mem[i].opcode = ZERO;
+            insn_mem[i].dst = MASK_ADDR(get_var(opt, '0'));
+            opt->matches[ZERO]++;
+            continue;
+        }
+
+        /* HALT: Terminate */
+        uint16_t halt_addr = 0;
+        if (match_pattern(vm, i, mem, (int) scan_depth, "ZZ!", &halt_addr) &&
+            halt_addr == vm->mask) {
+            insn_mem[i].opcode = HALT;
+            opt->matches[HALT]++;
+            continue;
+        }
+
+        /* JMP: Unconditional jump */
+        uint16_t jmp_target = 0;
+        if (match_pattern(vm, i, mem, (int) scan_depth, "00!", &jmp_target)) {
+            insn_mem[i].opcode = JMP;
+            insn_mem[i].dst = jmp_target;
+            /* This var '0' is the address being zeroed by the JMP sequence */
+            insn_mem[i].src = MASK_ADDR(get_var(opt, '0'));
+            opt->matches[JMP]++;
+            continue;
+        }
+
+        /* GET: Input character */
+        uint16_t get_dst = 0;
+        if (match_pattern(vm, i, mem, (int) scan_depth, "N!>", &get_dst)) {
+            insn_mem[i].opcode = GET;
+            insn_mem[i].dst = MASK_ADDR(get_dst);
+            opt->matches[GET]++;
+            continue;
+        }
+
+        /* PUT: Output character */
+        uint16_t put_src = 0;
+        if (match_pattern(vm, i, mem, (int) scan_depth, "!N>", &put_src)) {
+            insn_mem[i].opcode = PUT;
+            insn_mem[i].src = MASK_ADDR(put_src);
+            opt->matches[PUT]++;
+            continue;
+        }
+
+        /* INC/DEC/SUB */
+        uint16_t sub_src = 0, sub_dst = 0;
+        if (match_pattern(vm, i, mem, (int) scan_depth, "!!>", &sub_src,
+                          &sub_dst) &&
+            sub_src != sub_dst) {
+            if (opt->neg1_reg[MASK_ADDR(sub_src)]) {
+                insn_mem[i].opcode = INC;
+                insn_mem[i].dst = MASK_ADDR(sub_dst);
+                opt->matches[INC]++;
+            } else if (opt->one_reg[MASK_ADDR(sub_src)]) {
+                insn_mem[i].opcode = DEC;
+                insn_mem[i].dst = MASK_ADDR(sub_dst);
+                opt->matches[DEC]++;
+            } else {
+                insn_mem[i].opcode = SUB;
+                insn_mem[i].dst = MASK_ADDR(sub_dst);
+                insn_mem[i].src = MASK_ADDR(sub_src);
+                opt->matches[SUB]++;
+            }
+            continue;
+        }
+
+        /* Default to SUBLEQ */
+        insn_mem[i].opcode = SUBLEQ;
+        insn_mem[i].src = mem[MASK_ADDR(i)];
+        insn_mem[i].dst = mem[MASK_ADDR(i + 1)];
+        insn_mem[i].aux = mem[MASK_ADDR(i + 2)];
+        opt->matches[SUBLEQ]++;
+    }
+}
+
+/* Report performance statistics */
+static int report_stats(vm_t *vm)
+{
+    optimizer_t *opt = &vm->opt;
+    double elapsed = (double) (opt->end - opt->start) / CLOCKS_PER_SEC;
+    int64_t total_ops = 0, total_substitutions = 0;
+    FILE *err = stderr;
+
+    for (int i = 0; i < IMAX; i++) {
+        total_ops += opt->exec_count[i];
+        if (i != SUBLEQ)
+            total_substitutions += opt->matches[i];
+    }
+
+    const char *div = "+--------+---------------+--------------+----------+\n";
+    if (fputs(div, err) < 0)
+        return -1;
+    if (fprintf(err,
+                "| Instr. | Substitutions | Instr. count | Instr. %% |\n") < 0)
+        return -1;
+    if (fputs(div, err) < 0)
+        return -1;
+
+    if (fprintf(err, "| SUBLEQ | %13d | %12" PRId64 " | %7.1f%% |\n",
+                opt->matches[SUBLEQ], opt->exec_count[SUBLEQ],
+                total_ops ? 100.0 * opt->exec_count[SUBLEQ] / total_ops : 0.0) <
+        0)
+        return -1;
+
+    for (int i = 1; i < IMAX; i++) {
+        if (opt->matches[i] == 0 && opt->exec_count[i] == 0)
+            continue;
+        if (fprintf(err, "| %6s | %13d | %12" PRId64 " | %7.1f%% |\n",
+                    insn_names[i], opt->matches[i], opt->exec_count[i],
+                    total_ops ? 100.0 * opt->exec_count[i] / total_ops : 0.0) <
+            0)
+            return -1;
+    }
+
+    if (fputs(div, err) < 0)
+        return -1;
+    if (fprintf(err, "| Totals | %13lld | %12" PRId64 " |          |\n",
+                total_substitutions, total_ops) < 0)
+        return -1;
+    if (fputs(div, err) < 0)
+        return -1;
+    if (fprintf(err, "|         Execution time %.3f seconds             |\n",
+                elapsed) < 0)
+        return -1;
+    if (fputs(div, err) < 0)
+        return -1;
+    return 0;
+}
+
+/* Execute the virtual machine */
+static int execute_vm(vm_t *vm)
+{
+    vm->opt.start = clock();
+    /* Initial call to dispatch, passing NULL for the unused insn pointer. */
+    dispatch(vm, vm->pc, NULL);
+    vm->opt.end = clock();
+    return vm->error;
+}
+
+typedef void (*handler_func_t)(vm_t *vm, uint64_t pc, const insn_t *insn);
+/* The dispatch table, mapping opcodes to their handler functions */
+static handler_func_t const dispatch_table[IMAX] = {
+#define _(inst, inc) [inst] = handle_##inst,
+    INSN_LIST
+#undef _
+};
+
+/* Dispatch to instruction handlers. */
+HOT_PATH static void dispatch(vm_t *vm, uint64_t pc, const insn_t *unused_insn)
+{
+    (void) unused_insn;
+
+    if (UNLIKELY(pc >= vm->mem_size / 2 || vm->error))
+        return;
+
+    /* Read the instruction once, and pass a pointer to the handler. */
+    const insn_t *insn = &vm->insn_mem[pc];
+    uint8_t opcode = insn->opcode;
+    vm->opt.exec_count[opcode]++;
+
+    /* Use the dispatch table for a direct function call. The handler
+     * will then tail-call back to this dispatch function, continuing the
+     * execution cycle without growing the stack.
+     */
+    MUST_TAIL return dispatch_table[opcode](vm, pc, insn);
+}
+
+int main(int argc, char **argv)
+{
+    vm_t vm = {
+        .in = stdin,
+        .out = stdout,
+        .nbits = 16,
+        .mem_size = SZ,
+        .stats_enabled = false,
+        .optimize_enabled = true,
+    };
+    vm.mask = MASK_BITS(vm.nbits);
+
+    vm.mem = calloc(SZ, sizeof(uint16_t));
+    if (!vm.mem) {
+        fprintf(stderr, "Error: Failed to allocate main memory.\n");
+        return 1;
+    }
+
+    vm.insn_mem = calloc(SZ, sizeof(insn_t));
+    if (!vm.insn_mem) {
+        fprintf(stderr, "Error: Failed to allocate instruction memory.\n");
+        free(vm.mem);
+        return 1;
+    }
+
+    const char *image_file = NULL;
+    for (int i = 1; i < argc; ++i) {
+        if (!strcmp(argv[i], "-O")) /* Disable optimization */
+            vm.optimize_enabled = false;
+        else if (!strcmp(argv[i], "-s")) /* Enable statistics */
+            vm.stats_enabled = true;
+        else if (!image_file) /* Image file path */
+            image_file = argv[i];
+        else
+            fprintf(stderr, "Warning: Ignoring extra argument '%s'\n", argv[i]);
+    }
+
+    if (!image_file) {
+        fprintf(stderr, "Usage: %s <subleq.dec> [-O] [-s]\n", argv[0]);
+        free(vm.mem);
+        free(vm.insn_mem);
+        return 1;
+    }
+
+    FILE *file = fopen(image_file, "r");
+    if (!file) {
+        fprintf(stderr, "Error: Failed to open file '%s'\n", image_file);
+        free(vm.mem);
+        free(vm.insn_mem);
+        return 1;
+    }
+
+    long val;
+    uint64_t count = 0;
+    char sep;
+    while (fscanf(file, "%ld%c", &val, &sep) == 2) {
+        if (val < SHRT_MIN || val > SHRT_MAX) {
+            fprintf(stderr,
+                    "Error: Value %ld at position %" PRIu64
+                    " exceeds 16-bit signed limit\n",
+                    val, count);
+            fclose(file);
+            free(vm.mem);
+            free(vm.insn_mem);
+            return 1;
+        }
+
+        vm.mem[MASK_ADDR(vm.load_size)] = (uint16_t) val;
+        vm.load_size++;
+        count++;
+
+        if (sep != ',' && !isspace(sep) && sep != EOF) {
+            fprintf(stderr,
+                    "Error: Invalid format at position %" PRIu64
+                    " (expected comma or whitespace, got '%c')\n",
+                    count, sep);
+            fclose(file);
+            free(vm.mem);
+            free(vm.insn_mem);
+            return 1;
+        }
+        if (sep == EOF) /* End of file reached as separator */
+            break;
+    }
+
+    if (ferror(file) && !feof(file)) {
+        fprintf(stderr, "Error: Failed to read '%s'\n", image_file);
+        fclose(file);
+        free(vm.mem);
+        free(vm.insn_mem);
+        return 1;
+    }
+    if (fclose(file) < 0) {
+        fprintf(stderr, "Error: Failed to close file '%s'\n", image_file);
+        free(vm.mem);
+        free(vm.insn_mem);
+        return 2;
+    }
+    vm.max_addr = vm.load_size; /* Max address initialized to loaded size */
+
+#ifdef PLAT_POSIX
+    if (isatty(fileno(stdin)))
+        set_raw_mode();
+#endif
+
+    if (vm.optimize_enabled) {
+        optimize(&vm, vm.load_size);
+    } else {
+        fprintf(stderr,
+                "Optimizations disabled. Running as basic interpreter.\n");
+        for (uint64_t i = 0; i < vm.load_size; i++) {
+            insn_t *insn = &vm.insn_mem[MASK_ADDR(i)];
+            insn->opcode = SUBLEQ;
+            insn->src = vm.mem[MASK_ADDR(i)];
+            insn->dst = vm.mem[MASK_ADDR(i + 1)];
+            insn->aux = vm.mem[MASK_ADDR(i + 2)];
+        }
+    }
+
+    int status = execute_vm(&vm);
+    if (vm.stats_enabled && report_stats(&vm) < 0)
+        status = -1; /* Indicate error if stats reporting fails */
+
+    free(vm.mem);
+    free(vm.insn_mem);
+    return status;
+}

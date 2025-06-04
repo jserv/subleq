@@ -1,0 +1,9 @@
+subleq
+subleq.fth
+stage0.dec
+stage1.dec
+*.o
+*.exe
+*.a
+*.dll
+*.so
