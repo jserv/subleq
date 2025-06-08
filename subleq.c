@@ -178,7 +178,8 @@ static int vm_putch(int ch, FILE *out)
     _(INV, 21)    \
     _(NEG, 6)     \
     _(LSHIFT, 9)  \
-    _(DOUBLE, 9)
+    _(DOUBLE, 9)  \
+    _(LDINC, 27)
 
 /* clang-format off */
 enum {
@@ -396,6 +397,28 @@ HANDLE(ILOAD, {
     } else {
         vm->mem[MASK_ADDR(dst)] = vm->mem[MASK_ADDR(addr)];
     }
+})
+
+/* LDINC: D = m[m[S]], then m[S]++ */
+HANDLE(LDINC, {
+    uint16_t src_ptr = insn->src; /* S */
+    uint16_t dst = insn->dst;     /* D */
+    uint16_t addr = vm->mem[MASK_ADDR(src_ptr)];
+
+    /* Special handling for input from I/O address (vm->mask) */
+    if (UNLIKELY(addr == vm->mask)) {
+        int ch = vm_getch(vm->in);
+        if (UNLIKELY(ch == EOF || ch == -1)) {
+            vm->error = -1;
+            return;
+        }
+        vm->mem[MASK_ADDR(dst)] = (uint16_t) (-ch); /* Negated input value */
+    } else {
+        vm->mem[MASK_ADDR(dst)] = vm->mem[MASK_ADDR(addr)];
+    }
+
+    /* Post-increment the source pointer */
+    vm->mem[MASK_ADDR(src_ptr)]++;
 })
 
 /* ISTORE: Indirect store */
@@ -697,12 +720,16 @@ static void optimize(vm_t *vm, uint64_t proglen)
     memset(opt->zero_reg, 0, sizeof(opt->zero_reg));
     memset(opt->one_reg, 0, sizeof(opt->one_reg));
     memset(opt->neg1_reg, 0, sizeof(opt->neg1_reg));
-    memset(opt->matches, 0, sizeof(opt->matches));
 
     for (uint64_t i = 0; i < proglen; i++) {
         opt->zero_reg[i] = (mem[i] == 0);
         opt->one_reg[i] = (mem[i] == 1);
         opt->neg1_reg[i] = (mem[i] == vm->mask);
+
+        insn_mem[i].opcode = SUBLEQ;
+        insn_mem[i].src = MASK_ADDR(i);
+        insn_mem[i].dst = MASK_ADDR(i + 1);
+        insn_mem[i].aux = MASK_ADDR(i + 2);
     }
 
     for (uint64_t i = 0; i < proglen; i++) {
@@ -722,14 +749,35 @@ static void optimize(vm_t *vm, uint64_t proglen)
             continue;
         }
 
-        /* ILOAD: D = m[m[S]] */
-        uint16_t load_temp = 0;
+        /* ILOAD and LDINC fusion */
+        uint16_t iload_src_ptr = 0;
         if (match_pattern(vm, i, mem, (int) scan_depth,
-                          "00> !Z> Z0> ZZ> 11> ?Z> Z1> ZZ>", &load_temp) &&
+                          "00> !Z> Z0> ZZ> 11> ?Z> Z1> ZZ>", &iload_src_ptr) &&
             get_var(opt, '0') == (i + 15)) {
+            /* ILOAD pattern matched. Save its destination address before the
+             * next match_pattern call invalidates the optimizer version. */
+            uint16_t iload_dst = get_var(opt, '1');
+
+            uint16_t inc_src = 0, inc_dst = 0;
+
+            /* Check for a subsequent INC pattern. */
+            if (scan_depth >= 27 &&
+                match_pattern(vm, i + 24, mem, (int) (scan_depth - 24), "!!>",
+                              &inc_src, &inc_dst) &&
+                inc_src != inc_dst && opt->neg1_reg[MASK_ADDR(inc_src)] &&
+                inc_dst == iload_src_ptr) {
+                /* Success: Fuse into LDINC */
+                insn_mem[i].opcode = LDINC;
+                insn_mem[i].dst = MASK_ADDR(iload_dst);
+                insn_mem[i].src = MASK_ADDR(iload_src_ptr);
+                opt->matches[LDINC]++;
+                continue;
+            }
+
+            /* If not fused, fall back to a regular ILOAD */
             insn_mem[i].opcode = ILOAD;
-            insn_mem[i].dst = MASK_ADDR(get_var(opt, '1'));
-            insn_mem[i].src = MASK_ADDR(load_temp);
+            insn_mem[i].dst = MASK_ADDR(iload_dst);
+            insn_mem[i].src = MASK_ADDR(iload_src_ptr);
             opt->matches[ILOAD]++;
             continue;
         }
@@ -872,11 +920,16 @@ static void optimize(vm_t *vm, uint64_t proglen)
         /* JMP: Unconditional jump */
         uint16_t jmp_target = 0;
         if (match_pattern(vm, i, mem, (int) scan_depth, "00!", &jmp_target)) {
-            insn_mem[i].opcode = JMP;
-            insn_mem[i].dst = jmp_target;
-            /* This var '0' is the address being zeroed by the JMP sequence */
-            insn_mem[i].src = MASK_ADDR(get_var(opt, '0'));
-            opt->matches[JMP]++;
+            if (jmp_target == i) { /* Check for infinite loop */
+                insn_mem[i].opcode = HALT;
+                opt->matches[HALT]++;
+            } else {
+                insn_mem[i].opcode = JMP;
+                insn_mem[i].dst = jmp_target;
+                /* var '0' is the address being zeroed by the JMP sequence */
+                insn_mem[i].src = MASK_ADDR(get_var(opt, '0'));
+                opt->matches[JMP]++;
+            }
             continue;
         }
 
@@ -961,7 +1014,7 @@ static int report_stats(vm_t *vm)
     for (int i = 1; i < IMAX; i++) {
         if (opt->matches[i] == 0 && opt->exec_count[i] == 0)
             continue;
-        if (fprintf(err, "| %6s | %13d | %12" PRId64 " | %7.1f%% |\n",
+        if (fprintf(err, "| %-6s | %13d | %12" PRId64 " | %7.1f%% |\n",
                     insn_names[i], opt->matches[i], opt->exec_count[i],
                     total_ops ? 100.0 * opt->exec_count[i] / total_ops : 0.0) <
             0)
@@ -1132,11 +1185,10 @@ int main(int argc, char **argv)
         fprintf(stderr,
                 "Optimizations disabled. Running as basic interpreter.\n");
         for (uint64_t i = 0; i < vm.load_size; i++) {
-            insn_t *insn = &vm.insn_mem[MASK_ADDR(i)];
-            insn->opcode = SUBLEQ;
-            insn->src = vm.mem[MASK_ADDR(i)];
-            insn->dst = vm.mem[MASK_ADDR(i + 1)];
-            insn->aux = vm.mem[MASK_ADDR(i + 2)];
+            vm.insn_mem[MASK_ADDR(i)].opcode = SUBLEQ;
+            vm.insn_mem[MASK_ADDR(i)].src = vm.mem[MASK_ADDR(i)];
+            vm.insn_mem[MASK_ADDR(i)].dst = vm.mem[MASK_ADDR(i + 1)];
+            vm.insn_mem[MASK_ADDR(i)].aux = vm.mem[MASK_ADDR(i + 2)];
         }
     }
 
