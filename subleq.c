@@ -75,40 +75,8 @@
 #define OPTIMIZER_SCAN_DEPTH (3 * 64)
 
 #ifdef PLAT_POSIX
-static struct termios orig_termios;
-static bool term_initialized = false;
-
-/* Restore original terminal settings at exit */
-static void restore_terminal(void)
-{
-    if (!term_initialized)
-        return;
-    tcsetattr(STDIN_FILENO, TCSANOW, &orig_termios);
-    term_initialized = false;
-}
-
-/* Set terminal to raw mode for non-buffered, non-echoed input */
-static void set_raw_mode(void)
-{
-    if (term_initialized)
-        return;
-    if (tcgetattr(STDIN_FILENO, &orig_termios) == -1)
-        return;
-
-    struct termios raw = orig_termios;
-    raw.c_lflag &= ~(ECHO | ICANON | ISIG);
-    raw.c_iflag &= ~(IXON | ICRNL);
-    raw.c_oflag &= ~(OPOST);
-    raw.c_cc[VMIN] = 0;
-    raw.c_cc[VTIME] = 0;
-    if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) == -1)
-        return;
-
-    term_initialized = true;
-    atexit(restore_terminal);
-}
-
-/* Read a character from input stream, handling raw mode with non-blocking poll
+/* Read a character from input. For interactive terminals, this function uses
+ * poll() to block indefinitely until input is available.
  */
 static int vm_getch(FILE *in)
 {
@@ -117,20 +85,21 @@ static int vm_getch(FILE *in)
         return fgetc(in);
 
     struct pollfd pfd = {.fd = fd, .events = POLLIN};
-    unsigned char ch;
     int n;
 
-    while ((n = poll(&pfd, 1, 0)) < 0) {
+    /* Use poll with a timeout of -1 to wait indefinitely for input. */
+    while ((n = poll(&pfd, 1, -1)) < 0) {
         if (errno != EAGAIN && errno != EINTR)
-            return -1;
+            return -1; /* A real error occurred */
+        /* If interrupted by a signal, just poll again. */
     }
-    if (n == 0)
-        return -1;
-    while (read(fd, &ch, 1) < 0) {
-        if (errno != EAGAIN && errno != EINTR)
-            return -1;
-    }
-    return ch == 127 ? 8 : ch; /* Map DEL to backspace */
+
+    /* If we are here, poll() returned > 0, so data is ready. */
+    unsigned char ch;
+    if (read(fd, &ch, 1) > 0)
+        return ch;
+
+    return -1; /* EOF or read error */
 }
 
 /* Write a character to output stream, flushing for TTY */
@@ -1173,11 +1142,6 @@ int main(int argc, char **argv)
         return 2;
     }
     vm.max_addr = vm.load_size; /* Max address initialized to loaded size */
-
-#ifdef PLAT_POSIX
-    if (isatty(fileno(stdin)))
-        set_raw_mode();
-#endif
 
     if (vm.optimize_enabled) {
         optimize(&vm, vm.load_size);
