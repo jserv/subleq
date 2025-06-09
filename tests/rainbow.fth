@@ -14,8 +14,8 @@
 : white   esc[  51 emit 55 emit  109 emit ;   \ ESC[37m
 : reset   esc[  48 emit        109 emit ;     \ ESC[0m
 
-\ print “rainbow” with seven different colours
-: rainbow-demo
+\ print "rainbow" with seven different colours
+: rainbow
   red     82 emit          \ "R"
   yellow  97 emit          \ "a"
   green  105 emit          \ "i"
@@ -26,4 +26,4 @@
   reset  cr ;
 
 \ ------------- run once -------------
-rainbow-demo
+rainbow
