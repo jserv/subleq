@@ -62,7 +62,7 @@
 #endif
 
 /* Memory size for 16-bit addressing (2^16 = 65536 words) */
-#define SZ (1 << 16)
+#define SZ (1U << 16)
 
 /* Mask address to 16-bit range (0-65535) */
 #define MASK_ADDR(a) ((a) & (SZ - 1))
@@ -992,7 +992,7 @@ static int report_stats(vm_t *vm)
 
     if (fputs(div, err) < 0)
         return -1;
-    if (fprintf(err, "| Totals | %13lld | %12" PRId64 " |          |\n",
+    if (fprintf(err, "| Totals | %13" PRId64 " | %12" PRId64 " |          |\n",
                 total_substitutions, total_ops) < 0)
         return -1;
     if (fputs(div, err) < 0)
