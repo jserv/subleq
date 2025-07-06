@@ -74,6 +74,10 @@
 /* Maximum depth for optimizer pattern scanning */
 #define OPTIMIZER_SCAN_DEPTH (3 * 64)
 
+/* Profiler constants */
+#define MAX_HOT_SPOTS 64
+#define PROFILER_SAMPLE_RATE 1000 /* Sample every N instructions */
+
 #ifdef PLAT_POSIX
 /* Read a character from input. For interactive terminals, this function uses
  * poll() to block indefinitely until input is available.
@@ -179,6 +183,25 @@ typedef struct {
     uint16_t aux;   /* Auxiliary operand (e.g., SUBLEQ jump target) */
 } insn_t;
 
+/* Hot spot tracking for profiler */
+typedef struct {
+    uint64_t pc;         /* Program counter address */
+    uint64_t exec_count; /* Execution count */
+    uint8_t opcode;      /* Most frequent opcode */
+} hot_spot_t;
+
+/* Lightweight profiler state */
+typedef struct {
+    bool enabled;                        /* Profiler enabled flag */
+    uint64_t total_instructions;         /* Total instruction count */
+    uint64_t memory_accesses;            /* Total memory access count */
+    uint64_t *pc_heat_map;               /* PC execution heat map */
+    hot_spot_t hot_spots[MAX_HOT_SPOTS]; /* Top hot spots */
+    size_t hot_spot_count;               /* Number of valid hot spots */
+    clock_t start_time;                  /* Profiling start time */
+    clock_t end_time;                    /* Profiling end time */
+} profiler_t;
+
 /* Optimizer state */
 typedef struct {
     int matches[IMAX];        /* Count of matched instructions */
@@ -203,14 +226,69 @@ typedef struct {
     uint64_t load_size;    /* Loaded memory size */
     uint64_t max_addr;     /* Highest address written */
     optimizer_t opt;       /* Optimizer state */
+    profiler_t prof;       /* Profiler state */
     FILE *in, *out;        /* Input/output streams */
     int error;             /* Error flag (0 = no error, -1 = error) */
     bool stats_enabled;    /* Enable performance statistics */
     bool optimize_enabled; /* Enable instruction optimization */
+    bool profiler_enabled; /* Enable lightweight profiler */
 } vm_t;
 
 /* Forward declaration for the dispatcher with the unified signature */
 static void dispatch(vm_t *vm, uint64_t pc, const insn_t *insn);
+
+/* Profiler helper functions */
+static void profiler_init(vm_t *vm)
+{
+    profiler_t *prof = &vm->prof;
+
+    if (!vm->profiler_enabled) {
+        prof->enabled = false;
+        return;
+    }
+
+    prof->enabled = true;
+    prof->total_instructions = 0;
+    prof->memory_accesses = 0;
+    prof->hot_spot_count = 0;
+    prof->start_time = clock();
+
+    /* Allocate PC heat map if profiling enabled */
+    prof->pc_heat_map = calloc(vm->mem_size, sizeof(uint64_t));
+    if (!prof->pc_heat_map) {
+        fprintf(stderr, "Warning: Failed to allocate profiler memory\n");
+        prof->enabled = false;
+    }
+}
+
+static void profiler_cleanup(vm_t *vm)
+{
+    profiler_t *prof = &vm->prof;
+    free(prof->pc_heat_map);
+    prof->pc_heat_map = NULL;
+    prof->enabled = false;
+}
+
+static inline void profiler_record_pc(vm_t *vm, uint64_t pc)
+{
+    profiler_t *prof = &vm->prof;
+
+    if (!prof->enabled)
+        return;
+
+    prof->total_instructions++;
+
+    /* Record PC heat map every instruction */
+    if (prof->pc_heat_map)
+        prof->pc_heat_map[pc]++;
+}
+
+static inline void profiler_record_memory_access(vm_t *vm)
+{
+    profiler_t *prof = &vm->prof;
+    if (prof->enabled)
+        prof->memory_accesses++;
+}
 
 /* Define instruction handlers.
  * It accepts a pointer to the current instruction (@insn) to avoid redundant
@@ -224,6 +302,9 @@ static void dispatch(vm_t *vm, uint64_t pc, const insn_t *insn);
     {                                                         \
         (void) pc;                                            \
         (void) insn;                                          \
+                                                              \
+        /* Profiler hook - record PC execution */             \
+        profiler_record_pc(vm, pc);                           \
                                                               \
         uint64_t next_pc = pc + INSN_INCR_##inst;             \
         do                                                    \
@@ -247,7 +328,9 @@ HANDLE(SUBLEQ, {
             return;
         }
         vm->mem[MASK_ADDR(b)] = (uint16_t) ch;
+        profiler_record_memory_access(vm);
     } else if (UNLIKELY(b == vm->mask)) { /* Output */
+        profiler_record_memory_access(vm);
         if (UNLIKELY(vm_putch(vm->mem[MASK_ADDR(a)], vm->out) < 0)) {
             vm->error = -1;
             return;
@@ -255,8 +338,11 @@ HANDLE(SUBLEQ, {
     } else { /* Standard SUBLEQ */
         uint16_t la = MASK_ADDR(a);
         uint16_t lb = MASK_ADDR(b);
+        profiler_record_memory_access(vm); /* Read from la */
+        profiler_record_memory_access(vm); /* Read from lb */
         uint16_t result = vm->mem[lb] - vm->mem[la];
         vm->mem[lb] = result;
+        profiler_record_memory_access(vm); /* Write to lb */
         if (UNLIKELY(lb > vm->max_addr))
             vm->max_addr = lb;
         if (result == 0 || (result & (1U << (vm->nbits - 1))))
@@ -270,6 +356,7 @@ HANDLE(JMP, {
     /* Often the address cleared to 0 by the JMP sequence */
     uint16_t src = insn->src;
     vm->mem[MASK_ADDR(src)] = 0;
+    profiler_record_memory_access(vm);
     next_pc = dst;
 })
 
@@ -277,33 +364,43 @@ HANDLE(JMP, {
 HANDLE(MOV, {
     uint16_t dst = insn->dst;
     uint16_t src = insn->src;
+    profiler_record_memory_access(vm); /* Read from src */
     vm->mem[MASK_ADDR(dst)] = vm->mem[MASK_ADDR(src)];
+    profiler_record_memory_access(vm); /* Write to dst */
 })
 
 /* ADD: Addition */
 HANDLE(ADD, {
     uint16_t dst = insn->dst;
     uint16_t src = insn->src;
+    profiler_record_memory_access(vm); /* Read from src */
+    profiler_record_memory_access(vm); /* Read from dst */
     /* Unsigned arithmetic provides wrap-around behavior automatically */
     vm->mem[MASK_ADDR(dst)] += vm->mem[MASK_ADDR(src)];
+    profiler_record_memory_access(vm); /* Write to dst */
 })
 
 /* SUB: Subtraction */
 HANDLE(SUB, {
     uint16_t dst = insn->dst;
     uint16_t src = insn->src;
+    profiler_record_memory_access(vm); /* Read from src */
+    profiler_record_memory_access(vm); /* Read from dst */
     vm->mem[MASK_ADDR(dst)] -= vm->mem[MASK_ADDR(src)];
+    profiler_record_memory_access(vm); /* Write to dst */
 })
 
 /* ZERO: Clear memory location */
 HANDLE(ZERO, {
     uint16_t dst = insn->dst;
     vm->mem[MASK_ADDR(dst)] = 0;
+    profiler_record_memory_access(vm);
 })
 
 /* PUT: Output character */
 HANDLE(PUT, {
     uint16_t src = insn->src;
+    profiler_record_memory_access(vm);
     if (UNLIKELY(vm_putch(vm->mem[MASK_ADDR(src)], vm->out) < 0)) {
         vm->error = -1;
         return;
@@ -319,6 +416,7 @@ HANDLE(GET, {
         return;
     }
     vm->mem[MASK_ADDR(dst)] = (uint16_t) ch;
+    profiler_record_memory_access(vm);
 })
 
 /* HALT: Terminate program */
@@ -332,21 +430,30 @@ HANDLE(HALT, {
 HANDLE(IADD, {
     uint16_t dst = insn->dst;
     uint16_t src = insn->src;
+    profiler_record_memory_access(vm); /* Read pointer */
+    profiler_record_memory_access(vm); /* Read src */
     uint16_t addr = MASK_ADDR(vm->mem[MASK_ADDR(dst)]);
+    profiler_record_memory_access(vm); /* Read indirect */
     vm->mem[addr] += vm->mem[MASK_ADDR(src)];
+    profiler_record_memory_access(vm); /* Write indirect */
 })
 
 /* ISUB: Indirect subtraction */
 HANDLE(ISUB, {
     uint16_t dst = insn->dst;
     uint16_t src = insn->src;
+    profiler_record_memory_access(vm); /* Read pointer */
+    profiler_record_memory_access(vm); /* Read src */
     uint16_t addr = MASK_ADDR(vm->mem[MASK_ADDR(dst)]);
+    profiler_record_memory_access(vm); /* Read indirect */
     vm->mem[addr] -= vm->mem[MASK_ADDR(src)];
+    profiler_record_memory_access(vm); /* Write indirect */
 })
 
 /* IJMP: Indirect jump */
 HANDLE(IJMP, {
     uint16_t dst = insn->dst;
+    profiler_record_memory_access(vm);
     next_pc = vm->mem[MASK_ADDR(dst)];
 })
 
@@ -354,6 +461,7 @@ HANDLE(IJMP, {
 HANDLE(ILOAD, {
     uint16_t src = insn->src;
     uint16_t dst = insn->dst;
+    profiler_record_memory_access(vm); /* Read pointer */
     uint16_t addr = vm->mem[MASK_ADDR(src)];
     /* Special handling for input from I/O address (vm->mask) */
     if (UNLIKELY(addr == vm->mask)) {
@@ -364,14 +472,17 @@ HANDLE(ILOAD, {
         }
         vm->mem[MASK_ADDR(dst)] = (uint16_t) (-ch); /* Negated input value */
     } else {
+        profiler_record_memory_access(vm); /* Read indirect */
         vm->mem[MASK_ADDR(dst)] = vm->mem[MASK_ADDR(addr)];
     }
+    profiler_record_memory_access(vm); /* Write to dst */
 })
 
 /* LDINC: D = m[m[S]], then m[S]++ */
 HANDLE(LDINC, {
-    uint16_t src_ptr = insn->src; /* S */
-    uint16_t dst = insn->dst;     /* D */
+    uint16_t src_ptr = insn->src;      /* S */
+    uint16_t dst = insn->dst;          /* D */
+    profiler_record_memory_access(vm); /* Read pointer */
     uint16_t addr = vm->mem[MASK_ADDR(src_ptr)];
 
     /* Special handling for input from I/O address (vm->mask) */
@@ -383,56 +494,74 @@ HANDLE(LDINC, {
         }
         vm->mem[MASK_ADDR(dst)] = (uint16_t) (-ch); /* Negated input value */
     } else {
+        profiler_record_memory_access(vm); /* Read indirect */
         vm->mem[MASK_ADDR(dst)] = vm->mem[MASK_ADDR(addr)];
     }
 
     /* Post-increment the source pointer */
     vm->mem[MASK_ADDR(src_ptr)]++;
+    profiler_record_memory_access(vm); /* Write to dst */
+    profiler_record_memory_access(vm); /* Write pointer increment */
 })
 
 /* ISTORE: Indirect store */
 HANDLE(ISTORE, {
     uint16_t src = insn->src;
     uint16_t dst = insn->dst;
+    profiler_record_memory_access(vm); /* Read src */
+    profiler_record_memory_access(vm); /* Read pointer */
     vm->mem[MASK_ADDR(vm->mem[MASK_ADDR(dst)])] = vm->mem[MASK_ADDR(src)];
+    profiler_record_memory_access(vm); /* Write indirect */
 })
 
 /* INC: Increment by 1 */
 HANDLE(INC, {
     uint16_t dst = insn->dst;
+    profiler_record_memory_access(vm); /* Read */
     vm->mem[MASK_ADDR(dst)]++;
+    profiler_record_memory_access(vm); /* Write */
 })
 
 /* DEC: Decrement by 1 */
 HANDLE(DEC, {
     uint16_t dst = insn->dst;
+    profiler_record_memory_access(vm); /* Read */
     vm->mem[MASK_ADDR(dst)]--;
+    profiler_record_memory_access(vm); /* Write */
 })
 
 /* INV: Bitwise NOT */
 HANDLE(INV, {
     uint16_t dst = insn->dst;
+    profiler_record_memory_access(vm); /* Read */
     vm->mem[MASK_ADDR(dst)] = ~vm->mem[MASK_ADDR(dst)];
+    profiler_record_memory_access(vm); /* Write */
 })
 
 /* LSHIFT: Left shift by constant */
 HANDLE(LSHIFT, {
-    uint16_t src = insn->src; /* Shift count */
-    uint16_t dst = insn->dst; /* Value to be shifted */
+    uint16_t src = insn->src;          /* Shift count */
+    uint16_t dst = insn->dst;          /* Value to be shifted */
+    profiler_record_memory_access(vm); /* Read */
     vm->mem[MASK_ADDR(dst)] <<= src;
+    profiler_record_memory_access(vm); /* Write */
 })
 
 /* DOUBLE: Multiply by 2 (left shift by 1) */
 HANDLE(DOUBLE, {
     uint16_t dst = insn->dst;
+    profiler_record_memory_access(vm); /* Read */
     vm->mem[MASK_ADDR(dst)] <<= 1;
+    profiler_record_memory_access(vm); /* Write */
 })
 
 /* NEG: Two's complement negation (dst = 0 - src) */
 HANDLE(NEG, {
     uint16_t dst = insn->dst;
     uint16_t src = insn->src;
+    profiler_record_memory_access(vm); /* Read src */
     vm->mem[MASK_ADDR(dst)] = 0 - vm->mem[MASK_ADDR(src)];
+    profiler_record_memory_access(vm); /* Write dst */
 })
 
 /* Pattern matching function for SUBLEQ instruction optimization.
@@ -951,10 +1080,56 @@ static void optimize(vm_t *vm, uint64_t proglen)
     }
 }
 
+/* Generate hot spots analysis from PC heat map */
+static void profiler_analyze_hot_spots(vm_t *vm)
+{
+    profiler_t *prof = &vm->prof;
+
+    if (!prof->enabled || !prof->pc_heat_map)
+        return;
+
+    prof->hot_spot_count = 0;
+
+    /* Find hot spots and sort by execution count */
+    for (uint64_t pc = 0;
+         pc < vm->mem_size && prof->hot_spot_count < MAX_HOT_SPOTS; pc++) {
+        if (prof->pc_heat_map[pc] > 100) { /* Only significant hot spots */
+            hot_spot_t spot = {
+                .pc = pc,
+                .exec_count = prof->pc_heat_map[pc],
+                .opcode = vm->insn_mem[pc].opcode,
+            };
+
+            /* Insert in sorted order (simple insertion sort for small array) */
+            size_t insert_pos = prof->hot_spot_count;
+            for (size_t i = 0; i < prof->hot_spot_count; i++) {
+                if (spot.exec_count > prof->hot_spots[i].exec_count) {
+                    insert_pos = i;
+                    break;
+                }
+            }
+
+            /* Shift existing entries */
+            for (size_t i = prof->hot_spot_count; i > insert_pos; i--) {
+                if (i < MAX_HOT_SPOTS)
+                    prof->hot_spots[i] = prof->hot_spots[i - 1];
+            }
+
+            /* Insert new hot spot */
+            if (insert_pos < MAX_HOT_SPOTS) {
+                prof->hot_spots[insert_pos] = spot;
+                if (prof->hot_spot_count < MAX_HOT_SPOTS)
+                    prof->hot_spot_count++;
+            }
+        }
+    }
+}
+
 /* Report performance statistics */
 static int report_stats(vm_t *vm)
 {
     optimizer_t *opt = &vm->opt;
+    profiler_t *prof = &vm->prof;
     double elapsed = (double) (opt->end - opt->start) / CLOCKS_PER_SEC;
     int64_t total_ops = 0, total_substitutions = 0;
     FILE *err = stderr;
@@ -1002,6 +1177,98 @@ static int report_stats(vm_t *vm)
         return -1;
     if (fputs(div, err) < 0)
         return -1;
+
+    /* Profiler report */
+    if (vm->profiler_enabled && prof->enabled) {
+        prof->end_time = clock();
+        double prof_elapsed =
+            (double) (prof->end_time - prof->start_time) / CLOCKS_PER_SEC;
+
+        fprintf(err, "\n=== Lightweight Profiler Report ===\n");
+        fprintf(err, "Total instructions executed: %" PRIu64 "\n",
+                prof->total_instructions);
+        fprintf(err, "Memory accesses: %" PRIu64 "\n", prof->memory_accesses);
+        fprintf(err, "Instructions per second: %.0f\n",
+                prof_elapsed > 0 ? prof->total_instructions / prof_elapsed : 0);
+
+        if (prof->total_instructions > 0) {
+            fprintf(err, "Memory accesses per instruction: %.2f\n",
+                    (double) prof->memory_accesses / prof->total_instructions);
+        }
+
+        /* Hot spots analysis */
+        profiler_analyze_hot_spots(vm);
+        if (prof->hot_spot_count > 0) {
+            fprintf(err, "\nTop %zu Hot Spots:\n",
+                    prof->hot_spot_count > 10 ? 10 : prof->hot_spot_count);
+            fprintf(err, "    PC   | Exec Count |   %%   | Opcode\n");
+            fprintf(err, "---------|------------|-------|-------\n");
+
+            for (size_t i = 0; i < prof->hot_spot_count && i < 10; i++) {
+                hot_spot_t *spot = &prof->hot_spots[i];
+                double percent =
+                    prof->total_instructions > 0
+                        ? 100.0 * spot->exec_count / prof->total_instructions
+                        : 0;
+
+                fprintf(err, " %6" PRIu64 "  | %10" PRIu64 " | %5.1f | %-6s\n",
+                        spot->pc, spot->exec_count, percent,
+                        spot->opcode < IMAX ? insn_names[spot->opcode] : "???");
+            }
+        }
+
+        /* Export profiler data to file */
+        FILE *prof_file = fopen("profiler_report.txt", "w");
+        if (prof_file) {
+            fprintf(prof_file, "SUBLEQ VM Lightweight Profiler Report\n");
+            fprintf(prof_file, "=====================================\n");
+            fprintf(prof_file, "Execution time: %.3f seconds\n", prof_elapsed);
+            fprintf(prof_file, "Total instructions: %" PRIu64 "\n",
+                    prof->total_instructions);
+            fprintf(prof_file, "Memory accesses: %" PRIu64 "\n",
+                    prof->memory_accesses);
+            fprintf(
+                prof_file, "Instructions per second: %.0f\n",
+                prof_elapsed > 0 ? prof->total_instructions / prof_elapsed : 0);
+
+            fprintf(prof_file, "\nInstruction Mix:\n");
+            for (int i = 0; i < IMAX; i++) {
+                if (opt->exec_count[i] > 0) {
+                    fprintf(prof_file, "  %-8s: %12" PRId64 " (%6.2f%%)\n",
+                            insn_names[i], opt->exec_count[i],
+                            total_ops > 0
+                                ? 100.0 * opt->exec_count[i] / total_ops
+                                : 0);
+                }
+            }
+
+            if (prof->hot_spot_count > 0) {
+                fprintf(prof_file,
+                        "\nHot Spots (PC addresses with highest execution "
+                        "counts):\n");
+                for (size_t i = 0; i < prof->hot_spot_count; i++) {
+                    hot_spot_t *spot = &prof->hot_spots[i];
+                    double percent = prof->total_instructions > 0
+                                         ? 100.0 * spot->exec_count /
+                                               prof->total_instructions
+                                         : 0;
+
+                    fprintf(prof_file,
+                            "  PC %6" PRIu64 ": %10" PRIu64
+                            " executions (%5.1f%%) [%s]\n",
+                            spot->pc, spot->exec_count, percent,
+                            spot->opcode < IMAX ? insn_names[spot->opcode]
+                                                : "unknown");
+                }
+            }
+
+            fclose(prof_file);
+            fprintf(
+                err,
+                "\nDetailed profiler report saved to: profiler_report.txt\n");
+        }
+    }
+
     return 0;
 }
 
@@ -1052,6 +1319,7 @@ int main(int argc, char **argv)
         .mem_size = SZ,
         .stats_enabled = false,
         .optimize_enabled = true,
+        .profiler_enabled = false,
     };
     vm.mask = MASK_BITS(vm.nbits);
 
@@ -1074,6 +1342,8 @@ int main(int argc, char **argv)
             vm.optimize_enabled = false;
         else if (!strcmp(argv[i], "-s")) /* Enable statistics */
             vm.stats_enabled = true;
+        else if (!strcmp(argv[i], "-p")) /* Enable lightweight profiler */
+            vm.profiler_enabled = true;
         else if (!image_file) /* Image file path */
             image_file = argv[i];
         else
@@ -1081,7 +1351,10 @@ int main(int argc, char **argv)
     }
 
     if (!image_file) {
-        fprintf(stderr, "Usage: %s <subleq.dec> [-O] [-s]\n", argv[0]);
+        fprintf(stderr, "Usage: %s <subleq.dec> [-O] [-s] [-p]\n", argv[0]);
+        fprintf(stderr, "  -O    Disable optimization\n");
+        fprintf(stderr, "  -s    Enable statistics\n");
+        fprintf(stderr, "  -p    Enable lightweight profiler\n");
         free(vm.mem);
         free(vm.insn_mem);
         return 1;
@@ -1143,6 +1416,9 @@ int main(int argc, char **argv)
     }
     vm.max_addr = vm.load_size; /* Max address initialized to loaded size */
 
+    /* Initialize profiler */
+    profiler_init(&vm);
+
     if (vm.optimize_enabled) {
         optimize(&vm, vm.load_size);
     } else {
@@ -1159,6 +1435,9 @@ int main(int argc, char **argv)
     int status = execute_vm(&vm);
     if (vm.stats_enabled && report_stats(&vm) < 0)
         status = -1; /* Indicate error if stats reporting fails */
+
+    /* Cleanup profiler */
+    profiler_cleanup(&vm);
 
     free(vm.mem);
     free(vm.insn_mem);
