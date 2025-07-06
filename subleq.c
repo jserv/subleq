@@ -696,9 +696,9 @@ static void optimize(vm_t *vm, uint64_t proglen)
         opt->neg1_reg[i] = (mem[i] == vm->mask);
 
         insn_mem[i].opcode = SUBLEQ;
-        insn_mem[i].src = MASK_ADDR(i);
-        insn_mem[i].dst = MASK_ADDR(i + 1);
-        insn_mem[i].aux = MASK_ADDR(i + 2);
+        insn_mem[i].src = mem[MASK_ADDR(i)];
+        insn_mem[i].dst = mem[MASK_ADDR(i + 1)];
+        insn_mem[i].aux = mem[MASK_ADDR(i + 2)];
     }
 
     for (uint64_t i = 0; i < proglen; i++) {
