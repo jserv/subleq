@@ -78,6 +78,16 @@
 #define MAX_HOT_SPOTS 64
 #define PROFILER_SAMPLE_RATE 1000 /* Sample every N instructions */
 
+/* Pattern analysis constants - these represent the structure of specific
+ * SUBLEQ instruction sequences that the optimizer recognizes */
+#define SUBLEQ_INSN_SIZE 3 /* Each SUBLEQ instruction uses 3 memory words */
+
+/* Calculate pattern-specific jump target offsets based on instruction structure
+ */
+#define ILOAD_PATTERN_JUMP_OFFSET 15 /* Original: i + 15 */
+#define IJMP_PATTERN_JUMP_OFFSET 14  /* Original: i + (3 * 4) + 2 = i + 14 */
+#define LDINC_INCREMENT_OFFSET 24    /* Original: 24 (ILOAD pattern size) */
+
 #ifdef PLAT_POSIX
 /* Read a character from input. For interactive terminals, this function uses
  * poll() to block indefinitely until input is available.
@@ -236,6 +246,19 @@ typedef struct {
 
 /* Forward declaration for the dispatcher with the unified signature */
 static void dispatch(vm_t *vm, uint64_t pc, const insn_t *insn);
+
+/* Pattern analysis helper functions */
+
+/* Validate that a captured jump target matches the expected pattern structure.
+ * This ensures that the SUBLEQ sequences we're optimizing have the correct
+ * control flow relationships between instructions.
+ */
+static inline bool validate_jump_target(uint16_t target,
+                                        uint64_t base_pc,
+                                        int offset)
+{
+    return target == (base_pc + offset);
+}
 
 /* Profiler helper functions */
 static void profiler_init(vm_t *vm)
@@ -851,7 +874,8 @@ static void optimize(vm_t *vm, uint64_t proglen)
         uint16_t iload_src_ptr = 0;
         if (match_pattern(vm, i, mem, (int) scan_depth,
                           "00> !Z> Z0> ZZ> 11> ?Z> Z1> ZZ>", &iload_src_ptr) &&
-            get_var(opt, '0') == (i + 15)) {
+            validate_jump_target(get_var(opt, '0'), i,
+                                 ILOAD_PATTERN_JUMP_OFFSET)) {
             /* ILOAD pattern matched. Save its destination address before the
              * next match_pattern call invalidates the optimizer version. */
             uint16_t iload_dst = get_var(opt, '1');
@@ -859,9 +883,10 @@ static void optimize(vm_t *vm, uint64_t proglen)
             uint16_t inc_src = 0, inc_dst = 0;
 
             /* Check for a subsequent INC pattern. */
-            if (scan_depth >= 27 &&
-                match_pattern(vm, i + 24, mem, (int) (scan_depth - 24), "!!>",
-                              &inc_src, &inc_dst) &&
+            if (scan_depth >= INSN_INCR_LDINC &&
+                match_pattern(vm, i + LDINC_INCREMENT_OFFSET, mem,
+                              (int) (scan_depth - LDINC_INCREMENT_OFFSET),
+                              "!!>", &inc_src, &inc_dst) &&
                 inc_src != inc_dst && opt->neg1_reg[MASK_ADDR(inc_src)] &&
                 inc_dst == iload_src_ptr) {
                 /* Success: Fuse into LDINC */
@@ -945,7 +970,8 @@ static void optimize(vm_t *vm, uint64_t proglen)
         uint16_t ijmp_temp = 0;
         if (match_pattern(vm, i, mem, (int) scan_depth, "00> !Z> Z0> ZZ> ZZ>",
                           &ijmp_temp) &&
-            get_var(opt, '0') == (i + (3 * 4) + 2)) {
+            validate_jump_target(get_var(opt, '0'), i,
+                                 IJMP_PATTERN_JUMP_OFFSET)) {
             insn_mem[i].opcode = IJMP;
             insn_mem[i].dst = MASK_ADDR(ijmp_temp);
             opt->matches[IJMP]++;
