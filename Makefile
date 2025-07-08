@@ -29,13 +29,19 @@ CHECK_FILES := \
 	radix \
 	bitcount \
 	clz \
+	fibonacci \
 	log \
 	sqrt \
 	crc
 
 EXPECTED_loops = *
 EXPECTED_radix = 2730
+EXPECTED_bitcount = 4
+EXPECTED_clz = 11
+EXPECTED_fibonacci = 34
+EXPECTED_log = 3
 EXPECTED_sqrt = 49
+EXPECTED_crc = 12524
 
 check: $(BIN) stage0.dec
 	$(Q)$(foreach e,$(CHECK_FILES),\
