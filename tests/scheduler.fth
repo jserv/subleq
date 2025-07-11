@@ -1,5 +1,5 @@
-\ ======== producer/consumer demo ========
-\
+.( example: producer/consumer )
+
 \ Producer         Scheduler         Consumer
 \ ---------        ----------        ----------
 \ store4        ─▶ state2 = 0 ──┐
@@ -8,7 +8,8 @@
 \ ...xx done (prints)           │              ...yy done (prints)
 \ state1 = 1  ──────────────────┘              state2 = 1
 
-decimal
+' ( <ok> ! ( disable ok prompt [non-portable] )
+system +order
 
 \ ----- task states: 0 = ready, 1 = waiting -------------------------
 variable state1   0 state1 !      \ producer starts ready
