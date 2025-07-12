@@ -71,7 +71,7 @@ To define a new function, use the following format:
 
 Remember that spaces are critical in eForth syntax. After defining a function,
 simply type `hello` to execute it.
-Check the [Reference Manual](MANUAL.md) for details.
+Check the [Reference Manual](manual.md) for details.
 
 The system is self-hosting, meaning it can generate new eForth images using
 the current eForth image and source code. While Gforth is used to compile the
