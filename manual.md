@@ -2195,6 +2195,10 @@ create configuration
 
 [WAForth](https://github.com/remko/waforth) demonstrates Forth's remarkable portability through a complete interpreter and dynamic compiler written entirely in raw WebAssembly. The entire system fits into a 10k WebAssembly module and uses subroutine threading rather than traditional direct threading due to WebAssembly's structured constraints. WAForth exemplifies how Forth adapts to diverse architectures, from minimal embedded systems like SUBLEQ to modern web platforms.
 
+[Moving Forth](https://www.bradrodriguez.com/papers/) is a series on writing Forth kernels.
+
+[Implementing a Forth](https://ratfactor.com/forth/implementing) makes a list of several Forth implementations.
+
 #### Community Resources and Support
 
 The Forth programming community provides several venues for ongoing learning and assistance:
