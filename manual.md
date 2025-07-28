@@ -1,6 +1,6 @@
 # SUBLEQ eForth Reference Manual
 
-> A high-performance Forth implementation for SUBLEQ machines  
+> A high-performance Forth implementation for SUBLEQ machines
 > Self-hosting development environment on minimal hardware
 
 ## Table of Contents
@@ -51,33 +51,15 @@ SUBLEQ eForth represents the culmination of three progressive stages in computat
 
 ## Why Learn Forth?
 
-### Understanding the Forth Ecosystem
+Forth exists in a hierarchy of minimalism that reveals fundamental computing principles. ANS Forth provides hundreds of standardized words, eForth reduces this to ~30 primitives, and SUBLEQ eForth implements these primitives as virtual operations on a single hardware instruction. This progression demonstrates how software complexity can compensate for hardware simplicity.
 
-Forth exists in a hierarchy of minimalism that reveals fundamental computing principles. ANS Forth provides hundreds of standardized words for comprehensive functionality, making it suitable for general-purpose programming. eForth reduces this to approximately 30 primitive operations that bootstrap a complete system, with remaining words implemented in Forth itself rather than assembly language. SUBLEQ eForth takes minimalism to its logical extreme by implementing even these primitives as virtual operations on a single hardware instruction.
+Unlike languages that hide their implementation behind complex compilers, Forth exposes every mechanism directly to the programmer. You can understand and modify the entire system, from the interpreter loop to memory management. Working with SUBLEQ eForth develops programming intuition that transfers across all platforms - successfully implementing functionality on a single-instruction computer makes any conventional processor feel approachable.
 
-This progression from hundreds of operations to 30 primitives to one instruction demonstrates how software complexity can compensate for hardware simplicity. Each step trades performance for transparency, revealing the essential mechanisms hidden beneath higher-level abstractions.
-
-### Why Learn Forth Today
-
-Forth offers unique educational value that mainstream languages cannot provide. Unlike languages that hide their implementation behind complex compilers and runtimes, Forth exposes every mechanism directly to the programmer. You can understand and modify the entire system, from the interpreter loop to memory management to compilation strategies.
-
-Working with SUBLEQ eForth develops fundamental programming intuition that transfers across all platforms. Successfully implementing complex functionality on a single-instruction computer makes any conventional processor feel powerful and approachable. The constraints force elegant solutions and reveal optimization opportunities invisible in higher-level environments.
-
-The system serves as an ideal laboratory for understanding computer science fundamentals: language implementation, virtual machines, self-hosting compilers, and the relationship between hardware and software. Every component fits on a single screen, enabling complete comprehension of a working computer system.
-
-### Why Study SUBLEQ eForth Specifically
-
-SUBLEQ eForth demonstrates extreme minimalism made concrete: a complete, interactive language stack running on a computer with only one instruction. Understanding how this is possible clarifies the minimal boundary between hardware and software capabilities. The system provides hands-on bootstrapping education, walking through every self-hosting stage from macro-assembler through virtual machine to meta-compiler.
-
-The implementation serves as an ideal teaching laboratory where every layer fits on a single screen, enabling real-time instruction stepping, memory patching, and system rebuilding. Students observe how stacks, threaded code, and self-modifying interpreters integrate with OS-level concepts. The trivial ISA makes formal verification, constant-time countermeasures, and side-channel experiments feasible in ways impractical on larger cores.
-
-Working with SUBLEQ eForth develops a portability reflex. Successfully implementing eForth on a single-instruction computer makes porting to any microcontroller feel straightforward. Many contributors begin with SUBLEQ, then apply the same kernel to RISC-V, AVR, or FPGA soft-cores, demonstrating the educational value that extends far beyond the specific platform.
+SUBLEQ eForth serves as an ideal laboratory for understanding computer science fundamentals: language implementation, virtual machines, self-hosting compilers, and the relationship between hardware and software. Every component fits on a single screen, enabling complete comprehension of a working system. The trivial ISA makes formal verification and side-channel experiments feasible in ways impractical on larger cores.
 
 ## Implementation Context
 
-This reference manual describes a 16-bit Forth implementation where the fundamental data unit (called a "cell") is 16 bits. In Forth nomenclature, "word" refers to a language definition or command, while "cell" refers to the basic data storage unit. All examples and memory layouts assume 16-bit cells and addressing throughout this documentation. Critical addressing convention: Addresses refer to cells, not bytes, unless explicitly noted otherwise. For example, address `100` refers to the 100th cell (located at byte offset 200), not byte 100.
-
-Since SUBLEQ lacks conventional CALL and RET instructions, the inner interpreter employs dynamic code modification to achieve proper threading. The system implements address-range dispatch for primitive operations, performs runtime patching of NEXT instructions to enable high-level word threading, and handles return stack management through software simulation. Despite these single-instruction constraints, the implementation achieves remarkable performance optimization.
+This is a 16-bit Forth implementation where cells are 16 bits. Addresses refer to cells, not bytes - address `100` refers to the 100th cell (byte offset 200). Since SUBLEQ lacks CALL/RET instructions, the interpreter uses dynamic code modification for threading and software-simulated return stack management.
 
 ## Quick Start
 
@@ -94,33 +76,16 @@ Simply navigate to the provided URL and begin entering Forth commands immediatel
 
 ### Local Installation
 
-For development work, offline use, or when building custom configurations, you can compile SUBLEQ eForth locally using standard development tools.
+Requirements: C compiler, Gforth, GNU Make
 
-#### Prerequisites
-
-The build process requires three essential components:
-
-| Tool | Purpose | Availability |
-|------|---------|--------------|
-| C Compiler | Building the virtual machine | `gcc` or `clang` on most systems |
-| Gforth | Meta-compiler generation | Platform-specific installation |
-| GNU Make | Automated build process | Usually pre-installed on Unix systems |
-
-#### Platform-Specific Installation
-
-For macOS systems using Homebrew:
 ```shell
+# macOS
 brew install gforth
-```
 
-For Ubuntu and Debian-based Linux distributions:
-```shell
-sudo apt-get update
+# Ubuntu/Debian
 sudo apt-get install gforth build-essential
-```
 
-For Fedora and CentOS systems:
-```shell
+# Fedora/CentOS
 sudo dnf install gforth gcc make
 ```
 
@@ -129,43 +94,26 @@ sudo dnf install gforth gcc make
 The complete build and execution process requires only a few commands:
 
 ```shell
-# Clone the repository
-git clone https://github.com/jserv/subleq
-cd subleq
-
 # Build and run the system
 make run
 ```
 
 #### Build Process Details
 
-The `make run` command executes a carefully orchestrated build sequence:
+This builds the SUBLEQ emulator and launches the eForth interpreter. The system demonstrates bootstrapping: it can rebuild itself once established.
 
-1. Compiles the SUBLEQ emulator from C source code:
-   ```shell
-   gcc -o subleq subleq.c
-   ```
-
-2. Generates the eForth meta-compiler using the host Gforth system:
-   ```shell
-   gforth subleq.fth > stage0.dec
-   ```
-
-3. Compiles the complete Forth system and generates the final executable image
-
-4. Launches the interactive interpreter:
-   ```shell
-   ./subleq stage0.dec
-   ```
-
-This process demonstrates the bootstrapping principle: using an existing Forth system to create a new, independent Forth system that can subsequently rebuild itself.
+Additional Commands:
+- `make check` - Run test suite
+- `make bench` - Performance benchmarks
+- `make bootstrap` - Verify self-hosting
+- `make clean` - Remove built files
 
 ### Your First Interactive Session
 
 Begin exploring SUBLEQ eForth with this guided introduction to fundamental concepts and operations:
 
 ```forth
-\ Welcome to SUBLEQ eForth! 
+\ Welcome to SUBLEQ eForth!
 \ Comments start with backslash and extend to end of line
 
 \ List all available commands
@@ -212,15 +160,6 @@ bye
 
 This introductory session demonstrates the core concepts that make Forth unique: postfix notation for arithmetic, stack-based data manipulation, word definition and execution, and interactive system exploration.
 
-### Verifying Self-Hosting Capability
-
-To demonstrate the system's complete independence and self-sufficiency, you can verify its self-hosting capability:
-
-```shell
-make bootstrap
-```
-
-This process proves that the system can rebuild itself using only its own tools, without requiring external dependencies beyond the initial bootstrapping phase. Self-hosting capability represents a crucial milestone in system development, demonstrating that the implementation is sufficiently complete and robust to serve as its own development platform.
 
 ## System Architecture
 
@@ -271,7 +210,7 @@ subleq msg1, output
 subleq halt, halt, halt
 
 positive_branch:
-; x > 5: execute this path  
+; x > 5: execute this path
 subleq msg2, output
 subleq halt, halt, halt
 
@@ -461,7 +400,7 @@ The parsing rules apply consistently throughout the system. Entering `2+` will l
 When the line `2 3 * 2 + .` is entered, the following sequence occurs:
 
 1. `2` is pushed to the data stack
-2. `3` is pushed to the data stack  
+2. `3` is pushed to the data stack
 3. `*` pops `3` and `2`, multiplies them (3×2=6), pushes result
 4. `2` is pushed to the data stack
 5. `+` pops `2` and `6`, adds them (6+2=8), pushes result
@@ -485,7 +424,7 @@ Once entered, call the function by typing `hello` and pressing return. Note that
 ```forth
 : hello cr ."Hello, World" ;        \ Missing space before string
 :hello cr ."Hello, World";          \ Missing spaces around definition
-:hello cr ." Hello, World";         \ Multiple spacing issues  
+:hello cr ." Hello, World";         \ Multiple spacing issues
 : hello cr ."  Hello, World" ;      \ Extra spaces in string
 ```
 
@@ -615,7 +554,7 @@ Nested and compound control structures enable sophisticated program logic while 
     else
         dup 0< if
             ." Negative "
-            abs . 
+            abs .
         else
             ." Positive " .
         then
@@ -854,9 +793,9 @@ Forth provides conditional compilation capabilities through immediate words that
 `[if]`, `[else]`, and `[then]` function as compile-time conditionals that determine which code sections are included in the final program:
 
 ```forth
-0 [if] 
+0 [if]
     ." This won't compile"
-[else] 
+[else]
     ." This will compile"
 [then]
 ```
@@ -1012,7 +951,7 @@ Forth supports recursion through the `recurse` word, which provides safe self-re
 ```forth
 : x x ;                     \ Fails if `x` is not defined
 
-: y cr ." executing first y" ; 
+: y cr ." executing first y" ;
 : y cr ." new y" y ;         \ Calls the old definition of y
 y                           \ May produce redefinition warning
 ```
@@ -1119,7 +1058,7 @@ You can experiment with these operations:
 
 ```forth
 8 2 - .              \ Prints: 6
--1 -3 - .            \ Prints: 2  
+-1 -3 - .            \ Prints: 2
 9 3 / .              \ Prints: 3
 9 4 / .              \ Prints: 2 (integer division)
 ```
@@ -1142,7 +1081,7 @@ Examples of bitwise operations:
 ```forth
 -1 $A5A5 and .       \ Bitwise AND with hex number
 $A5A5 $5A5A and .    \ AND two hex values
-$A5A5 $5A5A or .     \ OR two hex values  
+$A5A5 $5A5A or .     \ OR two hex values
 $AA55 $5A5A xor .    \ XOR two hex values
 1 4 lshift .         \ Left shift: 1 becomes 16
 8192 2 rshift .      \ Right shift: 8192 becomes 2048
@@ -1743,7 +1682,7 @@ Immediate words represent a special category that executes even during compilati
 \ Examples of immediate words:
 : test             \ : is NOT immediate
     if             \ if IS immediate - executes during compilation
-        ." true"   \ ." IS immediate - executes during compilation  
+        ." true"   \ ." IS immediate - executes during compilation
     then           \ then IS immediate - executes during compilation
 ;                  \ ; IS immediate - exits compilation mode
 ```
@@ -1783,7 +1722,7 @@ The `create` and `does>` words enable creation of defining words - words that cr
 42 constant answer
 answer .           \ Prints: 42
 
-\ Define a word that creates variables  
+\ Define a word that creates variables
 : variable ( "name" -- )
     create 0 ,     \ Create word, compile initial value 0
     does>          \ When created word runs: return address
