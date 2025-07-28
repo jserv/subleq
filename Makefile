@@ -3,7 +3,7 @@ include mk/common.mk
 CFLAGS += -O2 -std=c99
 CFLAGS += -Wall -Wextra
 
-.PHONY: run bootstrap clean
+.PHONY: all run bootstrap check bench clean distclean
 
 BIN := subleq
 
@@ -86,3 +86,4 @@ clean:
 distclean: clean
 	$(RM) stage0.dec stage1.dec
 	$(RM) subleq.fth
+	$(RM) profiler_report.txt

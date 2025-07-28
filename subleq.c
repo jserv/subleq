@@ -681,10 +681,8 @@ static bool match_pattern(vm_t *vm,
     bool result = true;
 
     /* Early validation of input parameters */
-    if (UNLIKELY(!pattern || !mem || max_len <= 0)) {
-        va_end(args);
+    if (UNLIKELY(!pattern || !mem || max_len <= 0))
         return false;
-    }
 
     va_start(args, pattern);
 
@@ -1414,7 +1412,9 @@ int main(int argc, char **argv)
     long val;
     uint64_t count = 0;
     char sep;
-    while (fscanf(file, "%ld%c", &val, &sep) == 2) {
+    int scan_result;
+
+    while ((scan_result = fscanf(file, "%ld", &val)) == 1) {
         if (val < SHRT_MIN || val > SHRT_MAX) {
             fprintf(stderr,
                     "Error: Value %ld at position %" PRIu64
@@ -1430,18 +1430,13 @@ int main(int argc, char **argv)
         vm.load_size++;
         count++;
 
-        if (sep != ',' && !isspace(sep) && sep != EOF) {
-            fprintf(stderr,
-                    "Error: Invalid format at position %" PRIu64
-                    " (expected comma or whitespace, got '%c')\n",
-                    count, sep);
-            fclose(file);
-            free(vm.mem);
-            free(vm.insn_mem);
-            return 1;
+        /* Check for separator */
+        if (fscanf(file, "%c", &sep) == 1) {
+            if (sep == ',' || isspace(sep))
+                continue; /* Valid separator, continue reading */
+            /* Invalid separator, put it back and continue */
+            ungetc(sep, file);
         }
-        if (sep == EOF) /* End of file reached as separator */
-            break;
     }
 
     if (ferror(file) && !feof(file)) {
