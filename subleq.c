@@ -44,10 +44,12 @@
 #if defined(__clang__) || defined(__GNUC__)
 #define HOT_PATH __attribute__((hot))
 #define UNLIKELY(x) __builtin_expect(!!(x), 0)
+#define LIKELY(x) __builtin_expect(!!(x), 1)
 #define UNREACHABLE __builtin_unreachable()
 #else
 #define HOT_PATH
 #define UNLIKELY(x) (x)
+#define LIKELY(x) (x)
 #define UNREACHABLE \
     do {            \
     } while (0)
@@ -396,31 +398,52 @@ HANDLE(JMP, {
 
 /* MOV: Move data */
 HANDLE(MOV, {
-    uint16_t dst = insn->dst;
-    uint16_t src = insn->src;
+    uint16_t dst = MASK_ADDR(insn->dst);
+    uint16_t src = MASK_ADDR(insn->src);
     profiler_record_memory_access(vm); /* Read from src */
-    vm->mem[MASK_ADDR(dst)] = vm->mem[MASK_ADDR(src)];
+    /* Avoid redundant move */
+    if (LIKELY(src != dst))
+        vm->mem[dst] = vm->mem[src];
     profiler_record_memory_access(vm); /* Write to dst */
 })
 
 /* ADD: Addition */
 HANDLE(ADD, {
-    uint16_t dst = insn->dst;
-    uint16_t src = insn->src;
+    uint16_t dst = MASK_ADDR(insn->dst);
+    uint16_t src = MASK_ADDR(insn->src);
     profiler_record_memory_access(vm); /* Read from src */
     profiler_record_memory_access(vm); /* Read from dst */
-    /* Unsigned arithmetic provides wrap-around behavior automatically */
-    vm->mem[MASK_ADDR(dst)] += vm->mem[MASK_ADDR(src)];
+
+    /* Fast path for common values */
+    uint16_t src_val = vm->mem[src];
+    if (LIKELY(src_val != 0)) {
+        if (src_val == 1) {
+            vm->mem[dst]++;
+        } else {
+            vm->mem[dst] += src_val;
+        }
+    }
+    /* src_val == 0: no-op, skip write */
     profiler_record_memory_access(vm); /* Write to dst */
 })
 
 /* SUB: Subtraction */
 HANDLE(SUB, {
-    uint16_t dst = insn->dst;
-    uint16_t src = insn->src;
+    uint16_t dst = MASK_ADDR(insn->dst);
+    uint16_t src = MASK_ADDR(insn->src);
     profiler_record_memory_access(vm); /* Read from src */
     profiler_record_memory_access(vm); /* Read from dst */
-    vm->mem[MASK_ADDR(dst)] -= vm->mem[MASK_ADDR(src)];
+
+    /* Fast path for common values */
+    uint16_t src_val = vm->mem[src];
+    if (LIKELY(src_val != 0)) {
+        if (src_val == 1) {
+            vm->mem[dst]--;
+        } else {
+            vm->mem[dst] -= src_val;
+        }
+    }
+    /* src_val == 0: no-op, skip write */
     profiler_record_memory_access(vm); /* Write to dst */
 })
 
@@ -493,10 +516,11 @@ HANDLE(IJMP, {
 
 /* ILOAD: Indirect load */
 HANDLE(ILOAD, {
-    uint16_t src = insn->src;
-    uint16_t dst = insn->dst;
+    uint16_t src = MASK_ADDR(insn->src);
+    uint16_t dst = MASK_ADDR(insn->dst);
     profiler_record_memory_access(vm); /* Read pointer */
-    uint16_t addr = vm->mem[MASK_ADDR(src)];
+    uint16_t addr = vm->mem[src];
+
     /* Special handling for input from I/O address (vm->mask) */
     if (UNLIKELY(addr == vm->mask)) {
         int ch = vm_getch(vm->in);
@@ -504,20 +528,21 @@ HANDLE(ILOAD, {
             vm->error = -1;
             return;
         }
-        vm->mem[MASK_ADDR(dst)] = (uint16_t) (-ch); /* Negated input value */
+        vm->mem[dst] = (uint16_t) (-ch); /* Negated input value */
     } else {
+        /* Optimized: pre-mask address for better performance */
         profiler_record_memory_access(vm); /* Read indirect */
-        vm->mem[MASK_ADDR(dst)] = vm->mem[MASK_ADDR(addr)];
+        vm->mem[dst] = vm->mem[MASK_ADDR(addr)];
     }
     profiler_record_memory_access(vm); /* Write to dst */
 })
 
 /* LDINC: D = m[m[S]], then m[S]++ */
 HANDLE(LDINC, {
-    uint16_t src_ptr = insn->src;      /* S */
-    uint16_t dst = insn->dst;          /* D */
-    profiler_record_memory_access(vm); /* Read pointer */
-    uint16_t addr = vm->mem[MASK_ADDR(src_ptr)];
+    uint16_t src_ptr = MASK_ADDR(insn->src); /* S */
+    uint16_t dst = MASK_ADDR(insn->dst);     /* D */
+    profiler_record_memory_access(vm);       /* Read pointer */
+    uint16_t addr = vm->mem[src_ptr];
 
     /* Special handling for input from I/O address (vm->mask) */
     if (UNLIKELY(addr == vm->mask)) {
@@ -526,41 +551,42 @@ HANDLE(LDINC, {
             vm->error = -1;
             return;
         }
-        vm->mem[MASK_ADDR(dst)] = (uint16_t) (-ch); /* Negated input value */
+        vm->mem[dst] = (uint16_t) (-ch); /* Negated input value */
     } else {
         profiler_record_memory_access(vm); /* Read indirect */
-        vm->mem[MASK_ADDR(dst)] = vm->mem[MASK_ADDR(addr)];
+        vm->mem[dst] = vm->mem[MASK_ADDR(addr)];
     }
 
     /* Post-increment the source pointer */
-    vm->mem[MASK_ADDR(src_ptr)]++;
+    vm->mem[src_ptr]++;
     profiler_record_memory_access(vm); /* Write to dst */
     profiler_record_memory_access(vm); /* Write pointer increment */
 })
 
 /* ISTORE: Indirect store */
 HANDLE(ISTORE, {
-    uint16_t src = insn->src;
-    uint16_t dst = insn->dst;
+    uint16_t src = MASK_ADDR(insn->src);
+    uint16_t dst = MASK_ADDR(insn->dst);
     profiler_record_memory_access(vm); /* Read src */
     profiler_record_memory_access(vm); /* Read pointer */
-    vm->mem[MASK_ADDR(vm->mem[MASK_ADDR(dst)])] = vm->mem[MASK_ADDR(src)];
+    uint16_t addr = MASK_ADDR(vm->mem[dst]);
+    vm->mem[addr] = vm->mem[src];
     profiler_record_memory_access(vm); /* Write indirect */
 })
 
 /* INC: Increment by 1 */
 HANDLE(INC, {
-    uint16_t dst = insn->dst;
+    uint16_t dst = MASK_ADDR(insn->dst);
     profiler_record_memory_access(vm); /* Read */
-    vm->mem[MASK_ADDR(dst)]++;
+    vm->mem[dst]++;
     profiler_record_memory_access(vm); /* Write */
 })
 
 /* DEC: Decrement by 1 */
 HANDLE(DEC, {
-    uint16_t dst = insn->dst;
+    uint16_t dst = MASK_ADDR(insn->dst);
     profiler_record_memory_access(vm); /* Read */
-    vm->mem[MASK_ADDR(dst)]--;
+    vm->mem[dst]--;
     profiler_record_memory_access(vm); /* Write */
 })
 
