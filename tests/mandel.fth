@@ -1,10 +1,20 @@
 .( example: Mandelbrot set )
 
-\ This program renders the Mandelbrot set to a text console. It uses
+' ( <ok> ! ( disable ok prompt [non-portable] )
+
+\ This program renders the colorized Mandelbrot set to a text console. It uses
 \ 4-bit fixed-point arithmetic to simulate fractional numbers on an
 \ integer-only system. The core algorithm iterates the formula z = z^2 + c
-\ for each point on a 2D grid and selects a character to display based
-\ on how quickly the point's magnitude escapes a fixed threshold.
+\ for each point on a 2D grid and applies ANSI colors based on iteration count.
+\
+\ Colors represent different escape speeds:
+\ - Black: Interior points (never escape)
+\ - Blue: Very fast escape (1-4 iterations)
+\ - Cyan: Fast escape (5-9 iterations)
+\ - Green: Medium escape (10-14 iterations)
+\ - Yellow: Slower escape (15-24 iterations)
+\ - Magenta: Slow escape (25-34 iterations)
+\ - Red: Slowest escape (35+ iterations)
 
 \ --- Constants and Configuration ---
 
@@ -27,7 +37,21 @@
  20 constant ymax           \ Imaginary axis (y) maximum, scaled (1.25 * 16)
   1 constant ystep          \ Step size for y-axis (scaled)
 
-\ A simple palette for mapping iteration counts to display characters.
+\ ANSI color support
+: esc[   27 emit  91 emit ;
+
+\ color words for Mandelbrot visualization
+: black   esc[  51 emit 48 emit  109 emit ;   \ ESC[30m
+: red     esc[  51 emit 49 emit  109 emit ;   \ ESC[31m
+: green   esc[  51 emit 50 emit  109 emit ;   \ ESC[32m
+: yellow  esc[  51 emit 51 emit  109 emit ;   \ ESC[33m
+: blue    esc[  51 emit 52 emit  109 emit ;   \ ESC[34m
+: magenta esc[  51 emit 53 emit  109 emit ;   \ ESC[35m
+: cyan    esc[  51 emit 54 emit  109 emit ;   \ ESC[36m
+: white   esc[  51 emit 55 emit  109 emit ;   \ ESC[37m
+: reset   esc[  48 emit        109 emit ;     \ ESC[0m
+
+\ A colorized palette for mapping iteration counts to display characters.
 create palette
     char . c, char - c, char - c, char = c, char o c,
     char + c, char * c, char # c, char % c, bl c,
@@ -40,8 +64,20 @@ variable ci                 \ Caches the current y-coord for the inner loop
 
 \ --- Core Words ---
 
-: output ( iter -- )        \ Selects and emits a character from the palette.
-    5 / palette + c@ emit ; \ Maps a range of counts to each character.
+\ colorized output based on iteration count
+: color-for-iter ( iter -- )
+    dup 0 = if drop black exit then      \ interior: black
+    dup 5 < if drop blue exit then       \ very fast escape: blue
+    dup 10 < if drop cyan exit then      \ fast escape: cyan
+    dup 15 < if drop green exit then     \ medium escape: green
+    dup 25 < if drop yellow exit then    \ slower escape: yellow
+    dup 35 < if drop magenta exit then   \ slow escape: magenta
+    drop red ;                           \ slowest escape: red
+
+: output ( iter -- )        \ Colorized output for Mandelbrot visualization.
+    dup color-for-iter       \ Set color based on iteration count
+    5 / palette + c@ emit    \ Emit character from palette
+    reset ;                  \ Reset color after each character
 
 : muls ( a b -- ab/scale )  \ Performs scaled multiplication for fixed-point numbers.
     * scale / ;             \ Multiplies two scaled numbers and rescales the result.

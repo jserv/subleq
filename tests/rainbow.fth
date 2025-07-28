@@ -1,5 +1,7 @@
 \ ---------- ANSI color ----------
 
+' ( <ok> ! ( disable ok prompt [non-portable] )
+
 \ helper: send ESC (27) then '[' (91)
 : esc[   27 emit  91 emit ;
 
