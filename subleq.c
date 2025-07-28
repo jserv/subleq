@@ -65,7 +65,7 @@
 #define SZ (1U << 16)
 
 /* Mask address to 16-bit range (0-65535) */
-#define MASK_ADDR(a) ((a) & (SZ - 1))
+#define MASK_ADDR(a) ((uint16_t) ((a) & (SZ - 1)))
 
 /* Create a mask for N-bit values */
 #define MASK_BITS(nbits) \
@@ -76,7 +76,6 @@
 
 /* Profiler constants */
 #define MAX_HOT_SPOTS 64
-#define PROFILER_SAMPLE_RATE 1000 /* Sample every N instructions */
 
 /* Pattern analysis constants - these represent the structure of specific
  * SUBLEQ instruction sequences that the optimizer recognizes */
@@ -108,12 +107,18 @@ static int vm_getch(FILE *in)
         /* If interrupted by a signal, just poll again. */
     }
 
+    if (n == 0)
+        return -1; /* Timeout (shouldn't happen with -1) */
+
     /* If we are here, poll() returned > 0, so data is ready. */
     unsigned char ch;
-    if (read(fd, &ch, 1) > 0)
+    ssize_t bytes_read = read(fd, &ch, 1);
+    if (bytes_read == 1)
         return ch;
+    if (bytes_read == 0)
+        return EOF; /* EOF */
 
-    return -1; /* EOF or read error */
+    return -1; /* Read error */
 }
 
 /* Write a character to output stream, flushing for TTY */
@@ -129,12 +134,15 @@ static int vm_putch(int ch, FILE *out)
 /* Fallback for non-POSIX systems */
 static int vm_getch(FILE *in)
 {
-    return fgetc(in);
+    int ch = fgetc(in);
+    return (ch == EOF) ? -1 : ch;
 }
 
 static int vm_putch(int ch, FILE *out)
 {
-    if (fputc(ch, out) < 0 || fflush(out) < 0)
+    if (fputc(ch, out) < 0)
+        return -1;
+    if (fflush(out) < 0)
         return -1;
     return ch;
 }
@@ -188,6 +196,7 @@ static const char *insn_names[] = {
 /* Optimized instruction structure */
 typedef struct {
     uint8_t opcode; /* Instruction opcode (from INSN_LIST) */
+    uint8_t _pad;   /* Padding for alignment */
     uint16_t src;   /* Source operand address/value */
     uint16_t dst;   /* Destination operand address */
     uint16_t aux;   /* Auxiliary operand (e.g., SUBLEQ jump target) */
@@ -198,6 +207,7 @@ typedef struct {
     uint64_t pc;         /* Program counter address */
     uint64_t exec_count; /* Execution count */
     uint8_t opcode;      /* Most frequent opcode */
+    uint8_t _pad[7];     /* Padding for 64-byte cache line alignment */
 } hot_spot_t;
 
 /* Lightweight profiler state */
@@ -257,7 +267,7 @@ static inline bool validate_jump_target(uint16_t target,
                                         uint64_t base_pc,
                                         int offset)
 {
-    return target == (base_pc + offset);
+    return target == (uint16_t) (base_pc + offset);
 }
 
 /* Profiler helper functions */
@@ -281,6 +291,7 @@ static void profiler_init(vm_t *vm)
     if (!prof->pc_heat_map) {
         fprintf(stderr, "Warning: Failed to allocate profiler memory\n");
         prof->enabled = false;
+        return;
     }
 }
 
@@ -670,8 +681,10 @@ static bool match_pattern(vm_t *vm,
     bool result = true;
 
     /* Early validation of input parameters */
-    if (UNLIKELY(!pattern || !mem || max_len <= 0))
+    if (UNLIKELY(!pattern || !mem || max_len <= 0)) {
+        va_end(args);
         return false;
+    }
 
     va_start(args, pattern);
 
@@ -1343,6 +1356,10 @@ int main(int argc, char **argv)
         .out = stdout,
         .nbits = 16,
         .mem_size = SZ,
+        .pc = 0,
+        .load_size = 0,
+        .max_addr = 0,
+        .error = 0,
         .stats_enabled = false,
         .optimize_enabled = true,
         .profiler_enabled = false,
