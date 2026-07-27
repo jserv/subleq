@@ -2,9 +2,9 @@
  * subleq.c - A 16-bit SUBLEQ CPU running eForth.
  *
  * This file implements a virtual machine for a 16-bit SUBLEQ (Subtract and
- * Branch if Less than or Equal to zero) machine. It includes an optimizer
- * to convert common SUBLEQ instruction sequences into single, faster
- * extended operations for improved performance with programs like eForth.
+ * Branch if Less than or Equal to zero) machine. It includes an optimizer to
+ * convert common SUBLEQ instruction sequences into single, faster extended
+ * operations for improved performance with programs like eForth.
  */
 
 #include <assert.h>
@@ -19,6 +19,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+
+#include "pattern-meta.h"
 
 /* Platform detection for POSIX systems (Unix, macOS, etc.) */
 #if defined(unix) || defined(__unix__) || defined(__unix) || \
@@ -69,9 +71,11 @@
 /* Mask address to 16-bit range (0-65535) */
 #define MASK_ADDR(a) ((uint16_t) ((a) & (SZ - 1)))
 
-/* Create a mask for N-bit values */
-#define MASK_BITS(nbits) \
-    ((nbits) < 16 ? (uint16_t) ((1UL << (nbits)) - 1) : (uint16_t) 0xFFFFUL)
+/* Sign bit of a 16-bit word; a SUBLEQ result <= 0 iff zero or this bit set */
+#define SIGN_BIT 0x8000U
+
+/* All-ones word: the mask value, also the I/O sentinel address */
+#define WORD_MASK 0xFFFFU
 
 /* Maximum depth for optimizer pattern scanning */
 #define OPTIMIZER_SCAN_DEPTH (3 * 64)
@@ -79,17 +83,8 @@
 /* Profiler constants */
 #define MAX_HOT_SPOTS 64
 
-/* Pattern analysis constants - these represent the structure of specific
- * SUBLEQ instruction sequences that the optimizer recognizes */
-#define SUBLEQ_INSN_SIZE 3 /* Each SUBLEQ instruction uses 3 memory words */
-
-/* Calculate pattern-specific jump target offsets based on instruction structure
- */
-#define ILOAD_PATTERN_JUMP_OFFSET 15 /* Original: i + 15 */
-#define IJMP_PATTERN_JUMP_OFFSET 14  /* Original: i + (3 * 4) + 2 = i + 14 */
-#define LDINC_INCREMENT_OFFSET 24    /* Original: 24 (ILOAD pattern size) */
-
 #ifdef PLAT_POSIX
+
 /* Read a character from input. For interactive terminals, this function uses
  * poll() to block indefinitely until input is available.
  */
@@ -231,7 +226,6 @@ typedef struct {
     uint16_t vars[10];        /* Captured variable values */
     unsigned version;         /* Version counter for variable reset */
     int64_t exec_count[IMAX]; /* Execution count per instruction */
-    uint8_t zero_reg[SZ];     /* Tracks memory locations holding 0 */
     uint8_t one_reg[SZ];      /* Tracks memory locations holding 1 */
     uint8_t neg1_reg[SZ];     /* Tracks memory locations holding 0xFFFF */
     clock_t start, end;       /* Timers for performance measurement */
@@ -241,10 +235,11 @@ typedef struct {
 typedef struct {
     uint16_t *mem;         /* Main memory (16-bit words) */
     insn_t *insn_mem;      /* Optimized instruction memory */
-    uint64_t nbits;        /* Word size in bits (e.g., 16) */
-    uint16_t mask;         /* Bitmask for N-bit values */
+    uint16_t mask;         /* All-ones word (0xFFFF), also I/O sentinel */
     uint64_t mem_size;     /* Total memory size in words */
     uint64_t pc;           /* Program counter */
+    uint16_t code_start;   /* First executable image address after boot */
+    uint16_t max_fused_span; /* Widest fused op emitted; invalidation radius */
     uint64_t load_size;    /* Loaded memory size */
     uint64_t max_addr;     /* Highest address written */
     optimizer_t opt;       /* Optimizer state */
@@ -258,6 +253,54 @@ typedef struct {
 
 /* Forward declaration for the dispatcher with the unified signature */
 static void dispatch(vm_t *vm, uint64_t pc, const insn_t *insn);
+
+static inline void decode_subleq(vm_t *vm, uint64_t pc)
+{
+    insn_t *insn = &vm->insn_mem[MASK_ADDR(pc)];
+    insn->opcode = SUBLEQ;
+    insn->src = vm->mem[MASK_ADDR(pc)];
+    insn->dst = vm->mem[MASK_ADDR(pc + 1)];
+    insn->aux = vm->mem[MASK_ADDR(pc + 2)];
+}
+
+/* Widest fixed-span fused op is ISTORE (36 words). LSHIFT is the only op with a
+ * variable span (shift_count * 9), so optimize() raises vm->max_fused_span past
+ * this floor whenever it emits a wider one.
+ */
+#define MAX_FIXED_FUSED_SPAN INSN_INCR_ISTORE
+
+static inline void invalidate_code(vm_t *vm, uint16_t addr)
+{
+    if (!vm->optimize_enabled || addr < vm->code_start || addr >= vm->load_size)
+        return;
+
+    /* A store can only corrupt a fused op whose encoding words it overwrites,
+     * so re-decoding back one max-span reaches every fused op that could
+     * contain addr. Only fused words need refreshing; plain SUBLEQ reads
+     * operands live.
+     */
+    uint64_t first =
+        addr > vm->max_fused_span ? addr - vm->max_fused_span : 0;
+    for (uint64_t pc = first; pc <= addr && pc < vm->load_size; pc++)
+        if (vm->insn_mem[MASK_ADDR(pc)].opcode != SUBLEQ)
+            decode_subleq(vm, pc);
+}
+
+static inline void vm_store(vm_t *vm, uint16_t addr, uint16_t val)
+{
+    if (vm->mem[addr] == val)
+        return;
+    vm->mem[addr] = val;
+    invalidate_code(vm, addr);
+
+    /* Known limitation: INC/DEC/INV/LDINC bake in that a specific data cell
+     * holds +1/-1 and never re-read it. If self-modifying code overwrites that
+     * far-away constant cell, the fused op is not demoted and executes stale
+     * semantics. eForth never rewrites its shared 1/-1 constants, so this does
+     * not arise in practice; general SMC would need per-cell dependency
+     * tracking.
+     */
+}
 
 /* Pattern analysis helper functions */
 
@@ -326,11 +369,10 @@ static inline void profiler_record_memory_access(vm_t *vm)
         prof->memory_accesses++;
 }
 
-/* Define instruction handlers.
- * It accepts a pointer to the current instruction (@insn) to avoid redundant
- * memory lookups for its operands. The tail call to dispatch passes NULL for
- * the unused @insn parameter to maintain signature compatibility, which is
- * required for the 'musttail' attribute.
+/* Define instruction handlers. It accepts a pointer to the current instruction
+ * (@insn) to avoid redundant memory lookups for its operands. The tail call to
+ * dispatch passes NULL for the unused @insn parameter to maintain signature
+ * compatibility, which is required for the 'musttail' attribute.
  */
 #define HANDLE(inst, body)                                    \
     HOT_PATH static void handle_##inst(vm_t *vm, uint64_t pc, \
@@ -352,10 +394,10 @@ static inline void profiler_record_memory_access(vm_t *vm)
 
 /* SUBLEQ: Subtract and branch if less than or equal to zero */
 HANDLE(SUBLEQ, {
-    /* Operands are pre-fetched from memory by the optimizer */
-    uint16_t a = insn->src;
-    uint16_t b = insn->dst;
-    uint16_t c = insn->aux;
+    /* SUBLEQ code can be self-modifying; fetch raw operands live. */
+    uint16_t a = vm->mem[MASK_ADDR(pc)];
+    uint16_t b = vm->mem[MASK_ADDR(pc + 1)];
+    uint16_t c = vm->mem[MASK_ADDR(pc + 2)];
 
     if (UNLIKELY(a == vm->mask)) { /* Input */
         int ch = vm_getch(vm->in);
@@ -363,7 +405,7 @@ HANDLE(SUBLEQ, {
             vm->error = -1;
             return;
         }
-        vm->mem[MASK_ADDR(b)] = (uint16_t) ch;
+        vm_store(vm, MASK_ADDR(b), (uint16_t) ch);
         profiler_record_memory_access(vm);
     } else if (UNLIKELY(b == vm->mask)) { /* Output */
         profiler_record_memory_access(vm);
@@ -377,11 +419,11 @@ HANDLE(SUBLEQ, {
         profiler_record_memory_access(vm); /* Read from la */
         profiler_record_memory_access(vm); /* Read from lb */
         uint16_t result = vm->mem[lb] - vm->mem[la];
-        vm->mem[lb] = result;
+        vm_store(vm, lb, result);
         profiler_record_memory_access(vm); /* Write to lb */
         if (UNLIKELY(lb > vm->max_addr))
             vm->max_addr = lb;
-        if (result == 0 || (result & (1U << (vm->nbits - 1))))
+        if (result == 0 || (result & SIGN_BIT))
             next_pc = c;
     }
 })
@@ -391,7 +433,7 @@ HANDLE(JMP, {
     uint16_t dst = insn->dst;
     /* Often the address cleared to 0 by the JMP sequence */
     uint16_t src = insn->src;
-    vm->mem[MASK_ADDR(src)] = 0;
+    vm_store(vm, MASK_ADDR(src), 0);
     profiler_record_memory_access(vm);
     next_pc = dst;
 })
@@ -403,7 +445,7 @@ HANDLE(MOV, {
     profiler_record_memory_access(vm); /* Read from src */
     /* Avoid redundant move */
     if (LIKELY(src != dst))
-        vm->mem[dst] = vm->mem[src];
+        vm_store(vm, dst, vm->mem[src]);
     profiler_record_memory_access(vm); /* Write to dst */
 })
 
@@ -418,9 +460,9 @@ HANDLE(ADD, {
     uint16_t src_val = vm->mem[src];
     if (LIKELY(src_val != 0)) {
         if (src_val == 1) {
-            vm->mem[dst]++;
+            vm_store(vm, dst, vm->mem[dst] + 1);
         } else {
-            vm->mem[dst] += src_val;
+            vm_store(vm, dst, vm->mem[dst] + src_val);
         }
     }
     /* src_val == 0: no-op, skip write */
@@ -438,9 +480,9 @@ HANDLE(SUB, {
     uint16_t src_val = vm->mem[src];
     if (LIKELY(src_val != 0)) {
         if (src_val == 1) {
-            vm->mem[dst]--;
+            vm_store(vm, dst, vm->mem[dst] - 1);
         } else {
-            vm->mem[dst] -= src_val;
+            vm_store(vm, dst, vm->mem[dst] - src_val);
         }
     }
     /* src_val == 0: no-op, skip write */
@@ -450,7 +492,7 @@ HANDLE(SUB, {
 /* ZERO: Clear memory location */
 HANDLE(ZERO, {
     uint16_t dst = insn->dst;
-    vm->mem[MASK_ADDR(dst)] = 0;
+    vm_store(vm, MASK_ADDR(dst), 0);
     profiler_record_memory_access(vm);
 })
 
@@ -472,7 +514,7 @@ HANDLE(GET, {
         vm->error = -1;
         return;
     }
-    vm->mem[MASK_ADDR(dst)] = (uint16_t) ch;
+    vm_store(vm, MASK_ADDR(dst), (uint16_t) ch);
     profiler_record_memory_access(vm);
 })
 
@@ -491,7 +533,7 @@ HANDLE(IADD, {
     profiler_record_memory_access(vm); /* Read src */
     uint16_t addr = MASK_ADDR(vm->mem[MASK_ADDR(dst)]);
     profiler_record_memory_access(vm); /* Read indirect */
-    vm->mem[addr] += vm->mem[MASK_ADDR(src)];
+    vm_store(vm, addr, vm->mem[addr] + vm->mem[MASK_ADDR(src)]);
     profiler_record_memory_access(vm); /* Write indirect */
 })
 
@@ -503,7 +545,7 @@ HANDLE(ISUB, {
     profiler_record_memory_access(vm); /* Read src */
     uint16_t addr = MASK_ADDR(vm->mem[MASK_ADDR(dst)]);
     profiler_record_memory_access(vm); /* Read indirect */
-    vm->mem[addr] -= vm->mem[MASK_ADDR(src)];
+    vm_store(vm, addr, vm->mem[addr] - vm->mem[MASK_ADDR(src)]);
     profiler_record_memory_access(vm); /* Write indirect */
 })
 
@@ -528,11 +570,11 @@ HANDLE(ILOAD, {
             vm->error = -1;
             return;
         }
-        vm->mem[dst] = (uint16_t) (-ch); /* Negated input value */
+        vm_store(vm, dst, (uint16_t) (-ch)); /* Negated input value */
     } else {
         /* Optimized: pre-mask address for better performance */
         profiler_record_memory_access(vm); /* Read indirect */
-        vm->mem[dst] = vm->mem[MASK_ADDR(addr)];
+        vm_store(vm, dst, vm->mem[MASK_ADDR(addr)]);
     }
     profiler_record_memory_access(vm); /* Write to dst */
 })
@@ -551,14 +593,14 @@ HANDLE(LDINC, {
             vm->error = -1;
             return;
         }
-        vm->mem[dst] = (uint16_t) (-ch); /* Negated input value */
+        vm_store(vm, dst, (uint16_t) (-ch)); /* Negated input value */
     } else {
         profiler_record_memory_access(vm); /* Read indirect */
-        vm->mem[dst] = vm->mem[MASK_ADDR(addr)];
+        vm_store(vm, dst, vm->mem[MASK_ADDR(addr)]);
     }
 
     /* Post-increment the source pointer */
-    vm->mem[src_ptr]++;
+    vm_store(vm, src_ptr, vm->mem[src_ptr] + 1);
     profiler_record_memory_access(vm); /* Write to dst */
     profiler_record_memory_access(vm); /* Write pointer increment */
 })
@@ -570,7 +612,7 @@ HANDLE(ISTORE, {
     profiler_record_memory_access(vm); /* Read src */
     profiler_record_memory_access(vm); /* Read pointer */
     uint16_t addr = MASK_ADDR(vm->mem[dst]);
-    vm->mem[addr] = vm->mem[src];
+    vm_store(vm, addr, vm->mem[src]);
     profiler_record_memory_access(vm); /* Write indirect */
 })
 
@@ -578,7 +620,7 @@ HANDLE(ISTORE, {
 HANDLE(INC, {
     uint16_t dst = MASK_ADDR(insn->dst);
     profiler_record_memory_access(vm); /* Read */
-    vm->mem[dst]++;
+    vm_store(vm, dst, vm->mem[dst] + 1);
     profiler_record_memory_access(vm); /* Write */
 })
 
@@ -586,7 +628,7 @@ HANDLE(INC, {
 HANDLE(DEC, {
     uint16_t dst = MASK_ADDR(insn->dst);
     profiler_record_memory_access(vm); /* Read */
-    vm->mem[dst]--;
+    vm_store(vm, dst, vm->mem[dst] - 1);
     profiler_record_memory_access(vm); /* Write */
 })
 
@@ -594,7 +636,7 @@ HANDLE(DEC, {
 HANDLE(INV, {
     uint16_t dst = insn->dst;
     profiler_record_memory_access(vm); /* Read */
-    vm->mem[MASK_ADDR(dst)] = ~vm->mem[MASK_ADDR(dst)];
+    vm_store(vm, MASK_ADDR(dst), ~vm->mem[MASK_ADDR(dst)]);
     profiler_record_memory_access(vm); /* Write */
 })
 
@@ -603,15 +645,18 @@ HANDLE(LSHIFT, {
     uint16_t src = insn->src;          /* Shift count */
     uint16_t dst = insn->dst;          /* Value to be shifted */
     profiler_record_memory_access(vm); /* Read */
-    vm->mem[MASK_ADDR(dst)] <<= src;
+    vm_store(vm, MASK_ADDR(dst), vm->mem[MASK_ADDR(dst)] << src);
     profiler_record_memory_access(vm); /* Write */
+    /* This op fuses src doubling blocks (9 words each); skip past all of them,
+     * not just the first, or the trailing blocks re-shift the result. */
+    next_pc = pc + (uint64_t) src * INSN_INCR_LSHIFT;
 })
 
 /* DOUBLE: Multiply by 2 (left shift by 1) */
 HANDLE(DOUBLE, {
     uint16_t dst = insn->dst;
     profiler_record_memory_access(vm); /* Read */
-    vm->mem[MASK_ADDR(dst)] <<= 1;
+    vm_store(vm, MASK_ADDR(dst), vm->mem[MASK_ADDR(dst)] << 1);
     profiler_record_memory_access(vm); /* Write */
 })
 
@@ -620,16 +665,15 @@ HANDLE(NEG, {
     uint16_t dst = insn->dst;
     uint16_t src = insn->src;
     profiler_record_memory_access(vm); /* Read src */
-    vm->mem[MASK_ADDR(dst)] = 0 - vm->mem[MASK_ADDR(src)];
+    vm_store(vm, MASK_ADDR(dst), 0 - vm->mem[MASK_ADDR(src)]);
     profiler_record_memory_access(vm); /* Write dst */
 })
 
-/* Pattern matching function for SUBLEQ instruction optimization.
- * Matches instruction sequences against patterns using a compact
- * domain-specific language.
+/* Pattern matching function for SUBLEQ instruction optimization. Matches
+ * instruction sequences against patterns using a compact domain-specific
+ * language.
  *
- * Pattern symbols:
- * '0'-'9':
+ * Pattern symbols: '0'-'9':
  *   Variable capture/match. These symbols capture the value of the current
  *   memory word (mem[pc + offset]) into a numbered variable. If the variable
  *   is already bound, it asserts that the current value matches the bound
@@ -684,12 +728,12 @@ HANDLE(NEG, {
  *   Match Register/Variable reference (captured variable).
  *
  * @vm: Virtual machine context
- * @pc: The base program counter for the current instruction sequence
- * being matched (usually 'i' from the optimizer loop)
+ * @pc: The base program counter for the current instruction sequence being
+ * matched (usually 'i' from the optimizer loop)
  * @mem: A pointer to the full main memory array of the VM (vm->mem)
  * @max_len: The maximum number of words available for scanning from 'pc'
- * @pattern: The string containing the DSL pattern to match
- * @...: Variable arguments based on pattern symbols like '%' and '!'
+ * @pattern: The string containing the DSL pattern to match @...: Variable
+ * arguments based on pattern symbols like '%' and '!'
  *
  * Return true if pattern matches, false otherwise
  */
@@ -790,7 +834,7 @@ static bool match_pattern(vm_t *vm,
 
         case 'P':
             /* Match positive value (non-zero, MSB clear) */
-            if (UNLIKELY(val == 0 || (val & (1U << (vm->nbits - 1))))) {
+            if (UNLIKELY(val == 0 || (val & SIGN_BIT))) {
                 result = false;
             }
             break;
@@ -861,9 +905,9 @@ static inline uint16_t get_var(const optimizer_t *opt, char var)
 }
 
 /* Identifies common SUBLEQ sequences and replaces them with single extended
- * instructions. This optimization is crucial for improving the performance
- * of programs compiled to SUBLEQ, especially for high-level languages like
- * Forth which involve frequent stack, memory, and arithmetic operations that
+ * instructions. This optimization is crucial for improving the performance of
+ * programs compiled to SUBLEQ, especially for high-level languages like Forth
+ * which involve frequent stack, memory, and arithmetic operations that
  * translate into many primitive SUBLEQ instructions.
  *
  * @vm: Virtual machine context
@@ -875,12 +919,11 @@ static void optimize(vm_t *vm, uint64_t proglen)
     const uint16_t *mem = vm->mem;
     insn_t *insn_mem = vm->insn_mem;
 
-    memset(opt->zero_reg, 0, sizeof(opt->zero_reg));
     memset(opt->one_reg, 0, sizeof(opt->one_reg));
     memset(opt->neg1_reg, 0, sizeof(opt->neg1_reg));
+    vm->max_fused_span = MAX_FIXED_FUSED_SPAN;
 
     for (uint64_t i = 0; i < proglen; i++) {
-        opt->zero_reg[i] = (mem[i] == 0);
         opt->one_reg[i] = (mem[i] == 1);
         opt->neg1_reg[i] = (mem[i] == vm->mask);
 
@@ -890,7 +933,16 @@ static void optimize(vm_t *vm, uint64_t proglen)
         insn_mem[i].aux = mem[MASK_ADDR(i + 2)];
     }
 
-    for (uint64_t i = 0; i < proglen; i++) {
+    /* Fuse only the code region [code_start, proglen). The boot region below
+     * code_start stays plain SUBLEQ so that invalidate_code(), which skips
+     * writes below code_start, never leaves a stale fused op behind. A fused op
+     * is atomic on its prefetched operands, so a SUBLEQ sequence that rewrites
+     * a word inside its own fused span mid-execution would diverge from the
+     * plain interpreter; the matched patterns are rigid idioms that never do
+     * this, and anything self-modified after the fact is demoted back to SUBLEQ
+     * by invalidate_code() before it re-executes.
+     */
+    for (uint64_t i = vm->code_start; i < proglen; i++) {
         size_t scan_depth = (i + OPTIMIZER_SCAN_DEPTH > proglen)
                                 ? proglen - i
                                 : OPTIMIZER_SCAN_DEPTH;
@@ -909,12 +961,13 @@ static void optimize(vm_t *vm, uint64_t proglen)
 
         /* ILOAD and LDINC fusion */
         uint16_t iload_src_ptr = 0;
-        if (match_pattern(vm, i, mem, (int) scan_depth,
-                          "00> !Z> Z0> ZZ> 11> ?Z> Z1> ZZ>", &iload_src_ptr) &&
+        if (match_pattern(vm, i, mem, (int) scan_depth, ILOAD_PATTERN,
+                          &iload_src_ptr) &&
             validate_jump_target(get_var(opt, '0'), i,
                                  ILOAD_PATTERN_JUMP_OFFSET)) {
             /* ILOAD pattern matched. Save its destination address before the
-             * next match_pattern call invalidates the optimizer version. */
+             * next match_pattern call invalidates the optimizer version.
+             */
             uint16_t iload_dst = get_var(opt, '1');
 
             uint16_t inc_src = 0, inc_dst = 0;
@@ -969,6 +1022,10 @@ static void optimize(vm_t *vm, uint64_t proglen)
             insn_mem[i].dst = MASK_ADDR(shift_dst);
             insn_mem[i].src = shift_count;
             opt->matches[LSHIFT]++;
+            /* LSHIFT fuses shift_count 9-word blocks, so it can span past the
+             * fixed-op floor; widen the invalidation radius to cover it. */
+            if (shift_count * 9 > vm->max_fused_span)
+                vm->max_fused_span = (uint16_t) (shift_count * 9);
             continue;
         }
 
@@ -1005,7 +1062,7 @@ static void optimize(vm_t *vm, uint64_t proglen)
 
         /* IJMP: PC = m[D] */
         uint16_t ijmp_temp = 0;
-        if (match_pattern(vm, i, mem, (int) scan_depth, "00> !Z> Z0> ZZ> ZZ>",
+        if (match_pattern(vm, i, mem, (int) scan_depth, IJMP_PATTERN,
                           &ijmp_temp) &&
             validate_jump_target(get_var(opt, '0'), i,
                                  IJMP_PATTERN_JUMP_OFFSET)) {
@@ -1048,8 +1105,8 @@ static void optimize(vm_t *vm, uint64_t proglen)
             continue;
         }
 
-        /* NEG: Two's complement negation (dst = 0 - src)
-         * Pattern: SUBLEQ DST, DST, PC+3 (DST becomes 0)
+        /* NEG: Two's complement negation (dst = 0 - src) Pattern: SUBLEQ DST,
+         * DST, PC+3 (DST becomes 0)
          *          SUBLEQ SRC, DST, PC+6 (DST becomes 0 - SRC)
          * '0' is DST, '1' is SRC
          */
@@ -1366,9 +1423,9 @@ HOT_PATH static void dispatch(vm_t *vm, uint64_t pc, const insn_t *unused_insn)
     uint8_t opcode = insn->opcode;
     vm->opt.exec_count[opcode]++;
 
-    /* Use the dispatch table for a direct function call. The handler
-     * will then tail-call back to this dispatch function, continuing the
-     * execution cycle without growing the stack.
+    /* Use the dispatch table for a direct function call. The handler will then
+     * tail-call back to this dispatch function, continuing the execution cycle
+     * without growing the stack.
      */
     MUST_TAIL return dispatch_table[opcode](vm, pc, insn);
 }
@@ -1378,9 +1435,11 @@ int main(int argc, char **argv)
     vm_t vm = {
         .in = stdin,
         .out = stdout,
-        .nbits = 16,
+        .mask = WORD_MASK,
         .mem_size = SZ,
         .pc = 0,
+        .code_start = 0,
+        .max_fused_span = MAX_FIXED_FUSED_SPAN,
         .load_size = 0,
         .max_addr = 0,
         .error = 0,
@@ -1388,7 +1447,6 @@ int main(int argc, char **argv)
         .optimize_enabled = true,
         .profiler_enabled = false,
     };
-    vm.mask = MASK_BITS(vm.nbits);
 
     vm.mem = calloc(SZ, sizeof(uint16_t));
     if (!vm.mem) {
@@ -1441,6 +1499,13 @@ int main(int argc, char **argv)
     int scan_result;
 
     while ((scan_result = fscanf(file, "%ld", &val)) == 1) {
+        if (vm.load_size >= SZ) {
+            fprintf(stderr, "Error: image exceeds %d-word address space\n", SZ);
+            fclose(file);
+            free(vm.mem);
+            free(vm.insn_mem);
+            return 1;
+        }
         if (val < SHRT_MIN || val > SHRT_MAX) {
             fprintf(stderr,
                     "Error: Value %ld at position %" PRIu64
@@ -1479,6 +1544,14 @@ int main(int argc, char **argv)
         return 2;
     }
     vm.max_addr = vm.load_size; /* Max address initialized to loaded size */
+    /* mem[2] is the bootloader's entry point by convention. A bogus value (past
+     * the image) would suppress invalidation everywhere, silently disabling
+     * self-modifying-code support; fall back to fusing the whole image, which
+     * invalidate_code() then covers in full.
+     */
+    vm.code_start = vm.mem[MASK_ADDR(2)];
+    if (vm.code_start >= vm.load_size)
+        vm.code_start = 0;
 
     /* Initialize profiler */
     profiler_init(&vm);
@@ -1486,8 +1559,6 @@ int main(int argc, char **argv)
     if (vm.optimize_enabled) {
         optimize(&vm, vm.load_size);
     } else {
-        fprintf(stderr,
-                "Optimizations disabled. Running as basic interpreter.\n");
         for (uint64_t i = 0; i < vm.load_size; i++) {
             vm.insn_mem[MASK_ADDR(i)].opcode = SUBLEQ;
             vm.insn_mem[MASK_ADDR(i)].src = vm.mem[MASK_ADDR(i)];

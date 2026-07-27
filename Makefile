@@ -6,12 +6,17 @@ CFLAGS += -Wall -Wextra
 .PHONY: all run bootstrap check bench clean distclean
 
 BIN := subleq
+GEN_HDR := pattern-meta.h
 
 all: $(BIN)
 
-$(BIN): subleq.c
+$(BIN): subleq.c $(GEN_HDR)
 	$(VECHO) "  CC+LD\t$@\n"
 	$(Q)$(CC) $(CFLAGS) -o $@ subleq.c
+
+$(GEN_HDR): patterns.def tools/gen-patterns.awk
+	$(VECHO) "  GEN\t$@\n"
+	$(Q)awk -f tools/gen-patterns.awk patterns.def > $@
 
 run: $(BIN) stage0.dec
 	$(Q)./$(BIN) stage0.dec
@@ -53,6 +58,17 @@ check: $(BIN) stage0.dec
 	    exit 1; \
 	    fi; \
 	)
+	@# Raw SUBLEQ image shifting 6 left by 3 via consecutive doubling blocks:
+	@# the optimizer must fuse it to the same result the plain interpreter gives.
+	@# Regression guard for the LSHIFT multi-block fusion (would print 6<<6, not 6<<3).
+	$(Q)$(PRINTF) "Running tests/lshift.dec ... "; \
+	if [ "$$(./$(BIN) tests/lshift.dec | od -An -tu1)" = \
+	     "$$(./$(BIN) tests/lshift.dec -O | od -An -tu1)" ]; then \
+	    $(call notice, [OK]); \
+	else \
+	    $(PRINTF) "Failed.\n"; \
+	    exit 1; \
+	fi
 
 # bootstrapping
 bootstrap: stage0.dec stage1.dec
@@ -87,3 +103,4 @@ distclean: clean
 	$(RM) stage0.dec stage1.dec
 	$(RM) subleq.fth
 	$(RM) profiler_report.txt
+	$(RM) $(GEN_HDR)

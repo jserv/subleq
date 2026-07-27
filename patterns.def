@@ -1,0 +1,3 @@
+# name|pattern|jump_offset
+ILOAD|00> !Z> Z0> ZZ> 11> ?Z> Z1> ZZ>|15
+IJMP|00> !Z> Z0> ZZ> ZZ>|14
