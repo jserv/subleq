@@ -7,3 +7,4 @@ stage1.dec
 *.a
 *.dll
 *.so
+pattern-meta.h
